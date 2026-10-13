@@ -53,8 +53,10 @@ import binascii
 import codecs
 import hashlib
 import logging
+import logging.handlers
 import math
 import os
+import queue
 import secrets
 import select
 import signal
@@ -77,12 +79,39 @@ from starlette.middleware.base import BaseHTTPMiddleware
 # --------------------------------------------------------------------------
 # Logging — every incoming tool call is logged to the console.
 # --------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+#
+# Log records are handed to a background thread through a bounded queue instead of
+# being written to stderr directly. Writing straight to stderr from the event loop
+# means that if whoever launched this process never reads the pipe (for example
+# ``subprocess.Popen(..., stderr=PIPE)`` without draining it), the OS pipe buffer
+# (~64 KB) fills up, the write blocks, and the whole server freezes. With the queue
+# only the logging thread can block, and once the queue is full new records are
+# dropped, so the server keeps serving requests no matter what.
+class _DropOnFullQueueHandler(logging.handlers.QueueHandler):
+    def enqueue(self, record: logging.LogRecord) -> None:
+        try:
+            self.queue.put_nowait(record)
+        except queue.Full:
+            pass  # a stalled log consumer must never block the event loop
+
+
+_LOG_QUEUE_SIZE = 10_000
+_log_queue: queue.Queue = queue.Queue(maxsize=_LOG_QUEUE_SIZE)
+_log_stream_handler = logging.StreamHandler()
+_log_stream_handler.setFormatter(
+    logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 )
+_log_listener = logging.handlers.QueueListener(_log_queue, _log_stream_handler)
+_log_listener.start()  # daemon thread
+logging.basicConfig(level=logging.INFO, handlers=[_DropOnFullQueueHandler(_log_queue)])
 log = logging.getLogger("mcp-shell-server")
+
+# Commands can be huge (whole scripts); log only a prefix so logs stay small.
+_LOG_COMMAND_MAX_CHARS = 300
+
+
+def _clip(text: str, limit: int = _LOG_COMMAND_MAX_CHARS) -> str:
+    return text if len(text) <= limit else f"{text[:limit]}... [+{len(text) - limit} chars]"
 
 # How long a tool call may block before it hands back a background job. This is
 # a hard cap and intentionally matches the "60 second" requirement.
@@ -306,7 +335,7 @@ class Job:
                     self._timer.cancel()
                     self._timer = None
 
-        log.info("JOB START   | id=%s | pid=%s | command=%s", self.job_id, self.pid, self.command)
+        log.info("JOB START   | id=%s | pid=%s | command=%s", self.job_id, self.pid, _clip(self.command))
 
     def _pump(self, stream, is_stdout: bool) -> None:
         """Drain one pipe. Keeps a bounded character prefix but reads to EOF.
@@ -797,7 +826,7 @@ class ShellService:
 
         log.info(
             "EXEC REQUEST | cwd=%s | wait=%ss | max_runtime=%ss | command=%s",
-            self.cfg.cwd, wait, max_runtime or "unlimited", command,
+            self.cfg.cwd, wait, max_runtime or "unlimited", _clip(command),
         )
 
         job = self.manager.start(self.cfg, command, max_runtime)
