@@ -48,7 +48,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import binascii
 import codecs
+import hashlib
 import logging
 import math
 import os
@@ -84,6 +87,11 @@ log = logging.getLogger("mcp-shell-server")
 # How long a tool call may block before it hands back a background job. This is
 # a hard cap and intentionally matches the "60 second" requirement.
 MAX_SYNC_WAIT_SECONDS = 60.0
+
+# Largest file (decoded bytes) the upload/download tools will move.
+MAX_TRANSFER_BYTES = 50 * 1024 * 1024
+# Hard limit on any single git command run by git_push.
+GIT_TIMEOUT_SECONDS = 300.0
 
 # How often the async handler re-checks a job when the event-loop bridge is
 # unavailable (non-asyncio backends). Only a fallback.
@@ -848,6 +856,173 @@ class ShellService:
         self._stop_cleanup.set()
         self.manager.shutdown()
 
+    # -- file transfer -------------------------------------------------------
+    def _resolve_path(self, path: str) -> str:
+        """Resolve a user-supplied path against the server's working directory."""
+        if not isinstance(path, str) or not path.strip():
+            raise ValueError("path must be a non-empty string")
+        return os.path.abspath(os.path.join(self.cfg.cwd, os.path.expanduser(path)))
+
+    async def upload_file(
+        self,
+        path: str,
+        content_base64: str,
+        overwrite: bool = False,
+        executable: bool = False,
+    ) -> dict[str, Any]:
+        target = self._resolve_path(path)
+        return await asyncio.to_thread(self._write_file, target, content_base64, overwrite, executable)
+
+    @staticmethod
+    def _write_file(target: str, content_base64: str, overwrite: bool, executable: bool) -> dict[str, Any]:
+        try:
+            data = base64.b64decode(content_base64, validate=True)
+        except (ValueError, TypeError) as e:
+            raise ValueError(f"content_base64 is not valid base64: {e}") from e
+        if len(data) > MAX_TRANSFER_BYTES:
+            raise ValueError(f"file is {len(data)} bytes, larger than the {MAX_TRANSFER_BYTES}-byte limit")
+        if os.path.isdir(target):
+            raise IsADirectoryError(f"{target} is a directory")
+        existed = os.path.exists(target)
+        if existed and not overwrite:
+            raise FileExistsError(f"{target} already exists; pass overwrite=true to replace it")
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        # Write to a temp file in the same directory, then atomically rename it into place
+        # so a failed or interrupted upload never leaves a half-written target behind.
+        tmp = f"{target}.part-{uuid.uuid4().hex[:8]}"
+        try:
+            with open(tmp, "wb") as fh:
+                fh.write(data)
+                fh.flush()
+                os.fsync(fh.fileno())
+            if executable:
+                os.chmod(tmp, 0o755)
+            os.replace(tmp, target)
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        log.info("UPLOAD      | path=%s | bytes=%d | overwritten=%s", target, len(data), existed)
+        return {
+            "path": target,
+            "bytes": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "overwritten": existed,
+        }
+
+    async def download_file(self, path: str, max_bytes: int | None = None) -> dict[str, Any]:
+        target = self._resolve_path(path)
+        limit = MAX_TRANSFER_BYTES
+        if max_bytes is not None and max_bytes > 0:
+            limit = min(int(max_bytes), MAX_TRANSFER_BYTES)
+        return await asyncio.to_thread(self._read_file, target, limit)
+
+    @staticmethod
+    def _read_file(target: str, limit: int) -> dict[str, Any]:
+        if not os.path.isfile(target):
+            raise FileNotFoundError(f"no such file: {target}")
+        size = os.path.getsize(target)
+        if size > limit:
+            raise ValueError(f"file is {size} bytes, larger than the {limit}-byte limit")
+        with open(target, "rb") as fh:
+            data = fh.read(limit + 1)
+        if len(data) > limit:
+            raise ValueError(f"file grew past the {limit}-byte limit while reading")
+        log.info("DOWNLOAD    | path=%s | bytes=%d", target, len(data))
+        return {
+            "path": target,
+            "bytes": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "content_base64": base64.b64encode(data).decode("ascii"),
+        }
+
+    # -- git -----------------------------------------------------------------
+    async def git_push(
+        self,
+        repo_path: str,
+        commit_message: str | None = None,
+        add_paths: list[str] | None = None,
+        branch: str | None = None,
+        remote: str = "origin",
+    ) -> dict[str, Any]:
+        repo = self._resolve_path(repo_path)
+        return await asyncio.to_thread(self._git_push, repo, commit_message, add_paths, branch, remote)
+
+    @staticmethod
+    def _run_git(repo: str, *args: str) -> tuple[int, str, str]:
+        # GIT_TERMINAL_PROMPT=0 makes git fail instead of hanging on a credentials prompt.
+        env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+        try:
+            proc = subprocess.run(
+                ["git", "-C", repo, *args],
+                capture_output=True,
+                text=True,
+                timeout=GIT_TIMEOUT_SECONDS,
+                stdin=subprocess.DEVNULL,
+                env=env,
+            )
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(f"git {' '.join(args)} timed out after {GIT_TIMEOUT_SECONDS:g}s") from e
+        return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+
+    @classmethod
+    def _git_push(
+        cls,
+        repo: str,
+        commit_message: str | None,
+        add_paths: list[str] | None,
+        branch: str | None,
+        remote: str,
+    ) -> dict[str, Any]:
+        rc, top, err = cls._run_git(repo, "rev-parse", "--show-toplevel")
+        if rc != 0:
+            raise ValueError(f"not a git repository: {repo} ({err})")
+        repo = top
+
+        if branch is None:
+            # symbolic-ref works on an unborn branch (no commits yet), unlike rev-parse --abbrev-ref.
+            rc, branch_out, _ = cls._run_git(repo, "symbolic-ref", "--quiet", "--short", "HEAD")
+            if rc != 0 or not branch_out:
+                raise ValueError("repository is in detached HEAD state; pass branch explicitly")
+            branch = branch_out
+
+        # Stage either the requested paths or everything (.gitignore still applies).
+        if add_paths:
+            rc, _, err = cls._run_git(repo, "add", "--", *add_paths)
+        else:
+            rc, _, err = cls._run_git(repo, "add", "-A")
+        if rc != 0:
+            raise RuntimeError(f"git add failed: {err}")
+
+        # `git diff --cached --quiet` exits 1 when there are staged changes, 0 when there are none.
+        rc, _, err = cls._run_git(repo, "diff", "--cached", "--quiet")
+        if rc not in (0, 1):
+            raise RuntimeError(f"git diff failed: {err}")
+        has_changes = rc == 1
+
+        if has_changes:
+            message = commit_message or "Update from remote shell MCP"
+            rc, _, err = cls._run_git(repo, "commit", "-m", message)
+            if rc != 0:
+                raise RuntimeError(f"git commit failed: {err}")
+
+        rc, head, _ = cls._run_git(repo, "rev-parse", "HEAD")
+        commit_sha = head if rc == 0 else None
+
+        rc, out, err = cls._run_git(repo, "push", "-u", remote, f"HEAD:refs/heads/{branch}")
+        if rc != 0:
+            raise RuntimeError(f"git push failed: {err or out}")
+
+        log.info("GIT PUSH    | repo=%s | branch=%s | committed=%s | commit=%s", repo, branch, has_changes, commit_sha)
+        return {
+            "repo": repo,
+            "branch": branch,
+            "remote": remote,
+            "committed": has_changes,
+            "commit": commit_sha,
+            "pushed": True,
+            "push_output": err or out,
+        }
+
     # -- helpers -------------------------------------------------------------
     @staticmethod
     def validate_command(command: str) -> str:
@@ -926,6 +1101,49 @@ Returns:
     {"removed": N, "count": remaining_jobs}
 """
 
+upload_file_doc = """
+Upload a file to the server. The content is sent base64-encoded.
+
+Args:
+    path: Destination path. Relative paths resolve against the server's working directory.
+    content_base64: The file's bytes, base64-encoded.
+    overwrite: Replace the file if it already exists (default false).
+    executable: Mark the file executable (mode 755). Default is the normal file mode.
+
+Returns:
+    {"path", "bytes", "sha256", "overwritten"}. Errors if the file exceeds the transfer
+    limit, the content is not valid base64, or the file exists and overwrite is false.
+"""
+
+download_file_doc = """
+Download a file from the server. The content is returned base64-encoded.
+
+Args:
+    path: File to read. Relative paths resolve against the server's working directory.
+    max_bytes: Optional lower size limit for this call. Capped at the server's transfer limit.
+
+Returns:
+    {"path", "bytes", "sha256", "content_base64"}. Errors if the file does not exist or is
+    larger than the limit.
+"""
+
+git_push_doc = """
+Commit and push a git repository on the server to its remote (for example GitHub).
+
+Stages changes, commits them if anything is staged, then pushes the current branch. Uses the
+server's existing git credentials. Never prompts for a password, so it fails instead of hanging.
+
+Args:
+    repo_path: Path to the repository (a subdirectory of it is fine).
+    commit_message: Commit message. Default: "Update from remote shell MCP". Ignored if there are no changes.
+    add_paths: Specific paths to stage. Omit to stage everything (.gitignore still applies).
+    branch: Branch to push to. Default: the current branch.
+    remote: Remote name. Default: origin.
+
+Returns:
+    {"repo", "branch", "remote", "committed", "commit", "pushed", "push_output"}.
+"""
+
 
 # --------------------------------------------------------------------------
 # Server construction
@@ -963,6 +1181,9 @@ def build_server(service: ShellService) -> FastMCP:
     server.add_tool(service.list_jobs, description=list_jobs_doc)
     server.add_tool(service.terminate_job, description=terminate_job_doc)
     server.add_tool(service.cleanup_jobs, description=cleanup_jobs_doc)
+    server.add_tool(service.upload_file, description=upload_file_doc)
+    server.add_tool(service.download_file, description=download_file_doc)
+    server.add_tool(service.git_push, description=git_push_doc)
     server.shell_service = service  # type: ignore[attr-defined]
     return server
 
