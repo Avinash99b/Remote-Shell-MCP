@@ -117,8 +117,15 @@ def _clip(text: str, limit: int = _LOG_COMMAND_MAX_CHARS) -> str:
 # a hard cap and intentionally matches the "60 second" requirement.
 MAX_SYNC_WAIT_SECONDS = 60.0
 
-# Largest file (decoded bytes) the upload/download tools will move.
-MAX_TRANSFER_BYTES = 50 * 1024 * 1024
+# There is no total file-size limit. Files move as a series of chunks, one MCP call
+# each, so no single message holds the whole file. These caps bound each *call*
+# (memory per request), not the file. The real ceiling is the disk.
+UPLOAD_CHUNK_MAX_BYTES = 8 * 1024 * 1024
+DOWNLOAD_CHUNK_MAX_BYTES = 8 * 1024 * 1024
+# An upload that receives no chunk for this long is aborted and its temp file removed.
+UPLOAD_IDLE_TIMEOUT_SECONDS = 24 * 3600.0
+# Largest HTTP request body accepted: one base64 chunk plus JSON framing, with headroom.
+MCP_MAX_REQUEST_BODY_BYTES = 16 * 1024 * 1024
 # Hard limit on any single git command run by git_push.
 GIT_TIMEOUT_SECONDS = 300.0
 
@@ -775,6 +782,28 @@ async def _await_job(job: Job, wait_seconds: float) -> bool:
 # --------------------------------------------------------------------------
 # Shell service — owns configuration, the job registry and the tool methods.
 # --------------------------------------------------------------------------
+@dataclass
+class _UploadSession:
+    """State of one chunked upload. Bytes go to a temp file in the target directory."""
+
+    target: str
+    tmp: str
+    overwrite: bool
+    executable: bool
+    received: int = 0
+    sha: Any = field(default_factory=hashlib.sha256)
+    last_active: float = field(default_factory=time.monotonic)
+    closed: bool = False
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+
+def _decode_chunk(content_base64: str) -> bytes:
+    try:
+        return base64.b64decode(content_base64, validate=True)
+    except (ValueError, TypeError) as e:
+        raise ValueError(f"content_base64 is not valid base64: {e}") from e
+
+
 class ShellService:
     """Binds one :class:`Config` and :class:`JobManager` to the MCP tool methods.
 
@@ -790,6 +819,8 @@ class ShellService:
         self._stop_cleanup = threading.Event()
         self._reaper: threading.Thread | None = None
         self._reaper_started = False
+        self._uploads: dict[str, _UploadSession] = {}
+        self._uploads_lock = threading.Lock()
 
     def start_reaper(self) -> None:
         """Start the periodic cleanup thread (idempotent).
@@ -808,6 +839,7 @@ class ShellService:
         while not self._stop_cleanup.wait(interval):
             try:
                 removed = self.manager.cleanup(self.cfg)
+                self.sweep_uploads()
                 if removed:
                     log.info("CLEANUP     | reaped %d expired job(s)", removed)
             except Exception:  # noqa: BLE001 - reaper must never die
@@ -892,6 +924,8 @@ class ShellService:
             raise ValueError("path must be a non-empty string")
         return os.path.abspath(os.path.join(self.cfg.cwd, os.path.expanduser(path)))
 
+    # Single-call upload: the whole file in one message. Fine for small files; use the
+    # chunked tools (begin_upload / upload_chunk / finish_upload) for anything large.
     async def upload_file(
         self,
         path: str,
@@ -904,20 +938,13 @@ class ShellService:
 
     @staticmethod
     def _write_file(target: str, content_base64: str, overwrite: bool, executable: bool) -> dict[str, Any]:
-        try:
-            data = base64.b64decode(content_base64, validate=True)
-        except (ValueError, TypeError) as e:
-            raise ValueError(f"content_base64 is not valid base64: {e}") from e
-        if len(data) > MAX_TRANSFER_BYTES:
-            raise ValueError(f"file is {len(data)} bytes, larger than the {MAX_TRANSFER_BYTES}-byte limit")
+        data = _decode_chunk(content_base64)
         if os.path.isdir(target):
             raise IsADirectoryError(f"{target} is a directory")
         existed = os.path.exists(target)
         if existed and not overwrite:
             raise FileExistsError(f"{target} already exists; pass overwrite=true to replace it")
         os.makedirs(os.path.dirname(target), exist_ok=True)
-        # Write to a temp file in the same directory, then atomically rename it into place
-        # so a failed or interrupted upload never leaves a half-written target behind.
         tmp = f"{target}.part-{uuid.uuid4().hex[:8]}"
         try:
             with open(tmp, "wb") as fh:
@@ -938,31 +965,176 @@ class ShellService:
             "overwritten": existed,
         }
 
-    async def download_file(self, path: str, max_bytes: int | None = None) -> dict[str, Any]:
+    # Chunked upload: begin -> upload_chunk (repeat) -> finish. Any size.
+    async def begin_upload(self, path: str, overwrite: bool = False, executable: bool = False) -> dict[str, Any]:
         target = self._resolve_path(path)
-        limit = MAX_TRANSFER_BYTES
-        if max_bytes is not None and max_bytes > 0:
-            limit = min(int(max_bytes), MAX_TRANSFER_BYTES)
-        return await asyncio.to_thread(self._read_file, target, limit)
+        return await asyncio.to_thread(self._begin_upload, target, overwrite, executable)
+
+    def _begin_upload(self, target: str, overwrite: bool, executable: bool) -> dict[str, Any]:
+        if os.path.isdir(target):
+            raise IsADirectoryError(f"{target} is a directory")
+        if os.path.exists(target) and not overwrite:
+            raise FileExistsError(f"{target} already exists; pass overwrite=true to replace it")
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        upload_id = uuid.uuid4().hex
+        tmp = f"{target}.part-{upload_id[:8]}"
+        open(tmp, "wb").close()
+        with self._uploads_lock:
+            self._uploads[upload_id] = _UploadSession(
+                target=target, tmp=tmp, overwrite=overwrite, executable=executable
+            )
+        log.info("UPLOAD BEGIN| id=%s | path=%s", upload_id, target)
+        return {"upload_id": upload_id, "path": target, "chunk_max_bytes": UPLOAD_CHUNK_MAX_BYTES}
+
+    def _get_upload(self, upload_id: str) -> _UploadSession:
+        with self._uploads_lock:
+            session = self._uploads.get(upload_id)
+        if session is None:
+            raise ValueError(f"unknown upload_id: {upload_id} (already finished, aborted, or expired)")
+        return session
+
+    async def upload_chunk(self, upload_id: str, offset: int, content_base64: str) -> dict[str, Any]:
+        return await asyncio.to_thread(self._upload_chunk, upload_id, offset, content_base64)
+
+    def _upload_chunk(self, upload_id: str, offset: int, content_base64: str) -> dict[str, Any]:
+        session = self._get_upload(upload_id)
+        data = _decode_chunk(content_base64)
+        if len(data) > UPLOAD_CHUNK_MAX_BYTES:
+            raise ValueError(f"chunk is {len(data)} bytes; the per-call maximum is {UPLOAD_CHUNK_MAX_BYTES}")
+        if not isinstance(offset, int) or offset < 0:
+            raise ValueError("offset must be a non-negative integer")
+        with session.lock:
+            if session.closed:
+                raise ValueError(f"upload {upload_id} is already finished or aborted")
+            if offset > session.received:
+                raise ValueError(
+                    f"gap in upload: expected offset {session.received}, got {offset}. "
+                    "Send chunks in order (or resend from the expected offset)."
+                )
+            end = offset + len(data)
+            # Bytes below `received` were already accepted. A retry must match them exactly.
+            overlap_end = min(end, session.received)
+            if overlap_end > offset:
+                with open(session.tmp, "rb") as fh:
+                    fh.seek(offset)
+                    existing = fh.read(overlap_end - offset)
+                if existing != data[: overlap_end - offset]:
+                    raise ValueError(f"chunk at offset {offset} conflicts with data already received")
+            if end > session.received:
+                new = data[session.received - offset:]
+                with open(session.tmp, "ab") as fh:
+                    fh.write(new)
+                session.sha.update(new)
+                session.received = end
+            session.last_active = time.monotonic()
+            return {"upload_id": upload_id, "received_bytes": session.received}
+
+    async def finish_upload(self, upload_id: str, expected_sha256: str | None = None) -> dict[str, Any]:
+        return await asyncio.to_thread(self._finish_upload, upload_id, expected_sha256)
+
+    def _finish_upload(self, upload_id: str, expected_sha256: str | None) -> dict[str, Any]:
+        session = self._get_upload(upload_id)
+        with session.lock:
+            if session.closed:
+                raise ValueError(f"upload {upload_id} is already finished or aborted")
+            digest = session.sha.hexdigest()
+            if expected_sha256 and expected_sha256.lower() != digest:
+                raise ValueError(
+                    f"sha256 mismatch: expected {expected_sha256}, received {digest}. "
+                    "The upload is still open; resend or abort it."
+                )
+            existed = os.path.exists(session.target)
+            if existed and not session.overwrite:
+                raise FileExistsError(f"{session.target} already exists; the upload is still open and can be aborted")
+            with open(session.tmp, "rb+") as fh:
+                fh.flush()
+                os.fsync(fh.fileno())
+            if session.executable:
+                os.chmod(session.tmp, 0o755)
+            os.replace(session.tmp, session.target)
+            session.closed = True
+            size = session.received
+        with self._uploads_lock:
+            self._uploads.pop(upload_id, None)
+        log.info("UPLOAD DONE | id=%s | path=%s | bytes=%d | overwritten=%s", upload_id, session.target, size, existed)
+        return {
+            "path": session.target,
+            "bytes": size,
+            "sha256": digest,
+            "overwritten": existed,
+        }
+
+    async def abort_upload(self, upload_id: str) -> dict[str, Any]:
+        return await asyncio.to_thread(self._abort_upload, upload_id)
+
+    def _abort_upload(self, upload_id: str) -> dict[str, Any]:
+        with self._uploads_lock:
+            session = self._uploads.pop(upload_id, None)
+        if session is None:
+            return {"upload_id": upload_id, "aborted": False, "note": "unknown or already finished"}
+        with session.lock:
+            session.closed = True
+            if os.path.exists(session.tmp):
+                os.remove(session.tmp)
+        log.info("UPLOAD ABORT| id=%s | path=%s", upload_id, session.target)
+        return {"upload_id": upload_id, "aborted": True}
+
+    def sweep_uploads(self, max_idle: float = UPLOAD_IDLE_TIMEOUT_SECONDS) -> int:
+        """Abort uploads that have gone idle, so abandoned temp files do not pile up."""
+        now = time.monotonic()
+        with self._uploads_lock:
+            stale = [uid for uid, s in self._uploads.items() if now - s.last_active > max_idle]
+        for uid in stale:
+            self._abort_upload(uid)
+        return len(stale)
+
+    # Chunked download: read `length` bytes starting at `offset`. Loop until eof.
+    async def download_file(self, path: str, offset: int = 0, length: int | None = None) -> dict[str, Any]:
+        target = self._resolve_path(path)
+        if length is None:
+            length = DOWNLOAD_CHUNK_MAX_BYTES
+        if not isinstance(length, int) or length <= 0:
+            raise ValueError("length must be a positive integer")
+        if length > DOWNLOAD_CHUNK_MAX_BYTES:
+            raise ValueError(f"length {length} exceeds the per-call maximum of {DOWNLOAD_CHUNK_MAX_BYTES}; read in more calls")
+        if not isinstance(offset, int) or offset < 0:
+            raise ValueError("offset must be a non-negative integer")
+        return await asyncio.to_thread(self._read_chunk, target, offset, length)
 
     @staticmethod
-    def _read_file(target: str, limit: int) -> dict[str, Any]:
+    def _read_chunk(target: str, offset: int, length: int) -> dict[str, Any]:
         if not os.path.isfile(target):
             raise FileNotFoundError(f"no such file: {target}")
-        size = os.path.getsize(target)
-        if size > limit:
-            raise ValueError(f"file is {size} bytes, larger than the {limit}-byte limit")
         with open(target, "rb") as fh:
-            data = fh.read(limit + 1)
-        if len(data) > limit:
-            raise ValueError(f"file grew past the {limit}-byte limit while reading")
-        log.info("DOWNLOAD    | path=%s | bytes=%d", target, len(data))
+            total = os.fstat(fh.fileno()).st_size
+            if offset > total:
+                raise ValueError(f"offset {offset} is past the end of the file ({total} bytes)")
+            fh.seek(offset)
+            data = fh.read(length)
         return {
             "path": target,
+            "offset": offset,
             "bytes": len(data),
-            "sha256": hashlib.sha256(data).hexdigest(),
+            "total_bytes": total,
+            "eof": offset + len(data) >= total,
             "content_base64": base64.b64encode(data).decode("ascii"),
         }
+
+    async def file_sha256(self, path: str) -> dict[str, Any]:
+        target = self._resolve_path(path)
+        return await asyncio.to_thread(self._file_sha256, target)
+
+    @staticmethod
+    def _file_sha256(target: str) -> dict[str, Any]:
+        if not os.path.isfile(target):
+            raise FileNotFoundError(f"no such file: {target}")
+        h = hashlib.sha256()
+        size = 0
+        with open(target, "rb") as fh:
+            while block := fh.read(1024 * 1024):
+                h.update(block)
+                size += len(block)
+        return {"path": target, "bytes": size, "sha256": h.hexdigest()}
 
     # -- git -----------------------------------------------------------------
     async def git_push(
@@ -1131,29 +1303,86 @@ Returns:
 """
 
 upload_file_doc = """
-Upload a file to the server. The content is sent base64-encoded.
+Upload a whole file in one call (base64-encoded). Good for small files.
+
+For large files use begin_upload, then upload_chunk repeatedly, then finish_upload.
 
 Args:
     path: Destination path. Relative paths resolve against the server's working directory.
     content_base64: The file's bytes, base64-encoded.
     overwrite: Replace the file if it already exists (default false).
-    executable: Mark the file executable (mode 755). Default is the normal file mode.
+    executable: Mark the file executable (mode 755).
 
 Returns:
-    {"path", "bytes", "sha256", "overwritten"}. Errors if the file exceeds the transfer
-    limit, the content is not valid base64, or the file exists and overwrite is false.
+    {"path", "bytes", "sha256", "overwritten"}.
+"""
+
+begin_upload_doc = """
+Start a chunked upload. Returns an upload_id to use with upload_chunk and finish_upload.
+
+Args:
+    path: Destination path. Relative paths resolve against the server's working directory.
+    overwrite: Allow replacing an existing file when the upload finishes (default false).
+    executable: Mark the file executable when it finishes (mode 755).
+
+Returns:
+    {"upload_id", "path", "chunk_max_bytes"}.
+"""
+
+upload_chunk_doc = """
+Send one chunk of an open upload.
+
+Chunks must be sent in order. Resending a chunk you already sent is safe and is checked
+against the data already received. Use a chunk size up to chunk_max_bytes from begin_upload.
+
+Args:
+    upload_id: From begin_upload.
+    offset: Byte offset of this chunk in the file (0 for the first chunk).
+    content_base64: The chunk's bytes, base64-encoded.
+
+Returns:
+    {"upload_id", "received_bytes"}.
+"""
+
+finish_upload_doc = """
+Complete a chunked upload: verify, fsync, and move it into place.
+
+Args:
+    upload_id: From begin_upload.
+    expected_sha256: Optional sha256 of the whole file. If given, the upload is rejected on mismatch.
+
+Returns:
+    {"path", "bytes", "sha256", "overwritten"}.
+"""
+
+abort_upload_doc = """
+Cancel an open upload and delete its temp file. Uploads idle for 24 hours are also aborted.
+
+Args:
+    upload_id: From begin_upload.
 """
 
 download_file_doc = """
-Download a file from the server. The content is returned base64-encoded.
+Read part of a file, base64-encoded. Read a large file by looping: start at offset 0 and
+advance offset by the returned bytes until eof is true.
 
 Args:
     path: File to read. Relative paths resolve against the server's working directory.
-    max_bytes: Optional lower size limit for this call. Capped at the server's transfer limit.
+    offset: Byte offset to start from (default 0).
+    length: Bytes to read in this call (default and maximum: DOWNLOAD_CHUNK_MAX_BYTES).
 
 Returns:
-    {"path", "bytes", "sha256", "content_base64"}. Errors if the file does not exist or is
-    larger than the limit.
+    {"path", "offset", "bytes", "total_bytes", "eof", "content_base64"}.
+"""
+
+file_sha256_doc = """
+Compute the sha256 of a file on the server, streaming it, so it works for any size.
+
+Args:
+    path: File to hash. Relative paths resolve against the server's working directory.
+
+Returns:
+    {"path", "bytes", "sha256"}.
 """
 
 git_push_doc = """
@@ -1204,6 +1433,10 @@ def build_server(service: ShellService) -> FastMCP:
         host=service.cfg.host,
         port=service.cfg.port,
         transport_security=_transport_security(service.cfg),
+        # The SDK default is 4 MiB per HTTP request body. A chunk of UPLOAD_CHUNK_MAX_BYTES
+        # is about 11 MiB once base64-encoded, so raise the limit to fit one chunk plus JSON
+        # framing. It stays finite, so one request still cannot exhaust memory.
+        max_request_body_size=MCP_MAX_REQUEST_BODY_BYTES,
     )
     server.add_tool(service.run_shell_command, description=run_shell_command_doc)
     server.add_tool(service.get_job, description=get_job_doc)
@@ -1212,6 +1445,11 @@ def build_server(service: ShellService) -> FastMCP:
     server.add_tool(service.cleanup_jobs, description=cleanup_jobs_doc)
     server.add_tool(service.upload_file, description=upload_file_doc)
     server.add_tool(service.download_file, description=download_file_doc)
+    server.add_tool(service.begin_upload, description=begin_upload_doc)
+    server.add_tool(service.upload_chunk, description=upload_chunk_doc)
+    server.add_tool(service.finish_upload, description=finish_upload_doc)
+    server.add_tool(service.abort_upload, description=abort_upload_doc)
+    server.add_tool(service.file_sha256, description=file_sha256_doc)
     server.add_tool(service.git_push, description=git_push_doc)
     server.shell_service = service  # type: ignore[attr-defined]
     return server
