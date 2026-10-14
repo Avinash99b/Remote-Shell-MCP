@@ -39,6 +39,16 @@ Run:
     python mcp_shell_server.py --host 0.0.0.0 --port 8765 --token mysecret
     python mcp_shell_server.py --no-auth              # NOT recommended
     python mcp_shell_server.py --allowed-host shell-mcp-proxy.example.com   # behind a proxy/tunnel
+    python mcp_shell_server.py --log-level info        # log every tool call (default: warning)
+    python mcp_shell_server.py --log-file /tmp/shell-mcp.log   # write logs to a file instead of stderr
+
+Logging note: when the process is launched with a stderr pipe that nobody drains
+(for example a notebook doing subprocess.Popen(..., stderr=PIPE)), routine
+per-request logging would eventually fill the ~64 KB OS pipe buffer and block the
+server. Logging therefore defaults to WARNING and is written through a bounded
+queue on a background thread, so only startup lines, warnings and errors are
+emitted and a stalled log consumer can never block requests. Use --log-level or
+--log-file if you want more detail or a different destination.
 
 The agent connects to:  http://<host>:<port>/mcp
 with header:            Authorization: Bearer <token>   (unless --no-auth)
@@ -77,16 +87,39 @@ from starlette.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 # --------------------------------------------------------------------------
-# Logging — every incoming tool call is logged to the console.
+# Logging
 # --------------------------------------------------------------------------
 #
-# Log records are handed to a background thread through a bounded queue instead of
-# being written to stderr directly. Writing straight to stderr from the event loop
-# means that if whoever launched this process never reads the pipe (for example
-# ``subprocess.Popen(..., stderr=PIPE)`` without draining it), the OS pipe buffer
-# (~64 KB) fills up, the write blocks, and the whole server freezes. With the queue
-# only the logging thread can block, and once the queue is full new records are
-# dropped, so the server keeps serving requests no matter what.
+# Two properties matter for reliability when this server is launched with a stderr
+# (or stdout) pipe that nobody drains — the common notebook pattern
+# ``subprocess.Popen(..., stderr=PIPE)``:
+#
+#   1. Routine per-request logging is NOT emitted by default. A single ordinary
+#      request otherwise produces several INFO lines (our EXEC/JOB/UPLOAD lines,
+#      the MCP SDK's "Processing request ..." line, and uvicorn's access line).
+#      Over a long session those steadily fill the ~64 KB OS pipe buffer; once it
+#      is full, any further write blocks.
+#   2. Even when more verbose logging is enabled, a stalled log consumer must
+#      never block the request path. Records therefore go through a bounded queue
+#      to a background writer thread; if that consumer stalls, records are dropped
+#      instead of blocking the event loop or the request handlers.
+#
+# So routine request/job lines go to ``req_log`` (suppressed unless --log-level
+# opts in) while one-off startup lines, warnings and errors go to ``log`` and are
+# always emitted. Third-party loggers (the MCP SDK, uvicorn, httpx) are gated by
+# the root logger, which defaults to WARNING.
+LOG_NAME = "mcp-shell-server"
+REQUEST_LOG_NAME = f"{LOG_NAME}.requests"
+DEFAULT_LOG_LEVEL = "warning"
+
+_LOG_QUEUE_SIZE = 10_000
+_LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
+_LOG_DATEFMT = "%Y-%m-%d %H:%M:%S"
+# Third-party loggers that are chatty at INFO. Gating them explicitly is
+# belt-and-braces on top of the root logger level, which normally covers them.
+_NOISY_LOGGERS = ("mcp", "uvicorn", "uvicorn.error", "uvicorn.access", "httpx", "httpcore")
+
+
 class _DropOnFullQueueHandler(logging.handlers.QueueHandler):
     def enqueue(self, record: logging.LogRecord) -> None:
         try:
@@ -95,16 +128,96 @@ class _DropOnFullQueueHandler(logging.handlers.QueueHandler):
             pass  # a stalled log consumer must never block the event loop
 
 
-_LOG_QUEUE_SIZE = 10_000
-_log_queue: queue.Queue = queue.Queue(maxsize=_LOG_QUEUE_SIZE)
-_log_stream_handler = logging.StreamHandler()
-_log_stream_handler.setFormatter(
-    logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-)
-_log_listener = logging.handlers.QueueListener(_log_queue, _log_stream_handler)
-_log_listener.start()  # daemon thread
-logging.basicConfig(level=logging.INFO, handlers=[_DropOnFullQueueHandler(_log_queue)])
-log = logging.getLogger("mcp-shell-server")
+def _resolve_log_level(value: object) -> int:
+    """Map a level name, numeric level or ``None`` to a logging level (WARNING fallback)."""
+    if isinstance(value, bool):  # bool is an int subclass; never a level
+        return logging.WARNING
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        resolved = logging.getLevelName(value.strip().upper())
+        if isinstance(resolved, int):
+            return resolved
+    return logging.WARNING
+
+
+def _log_level_name(level: object) -> str:
+    """Canonical lowercase level name (e.g. ``"warning"``) for a level value."""
+    return logging.getLevelName(_resolve_log_level(level)).lower()
+
+
+_log_listener: logging.handlers.QueueListener | None = None
+_log_stream_handler: logging.Handler | None = None
+
+
+def configure_logging(
+    level: object = DEFAULT_LOG_LEVEL, log_file: str | None = None
+) -> logging.handlers.QueueListener:
+    """Install queue-backed logging. Idempotent and safe to call repeatedly.
+
+    ``level`` gates routine request/job and third-party (MCP SDK, uvicorn, httpx)
+    logging; startup lines, warnings and errors are always emitted. ``log_file``
+    sends records to a rotating file instead of stderr, which is useful when the
+    process's stderr is not being drained.
+    """
+    global _log_listener, _log_stream_handler
+    resolved = _resolve_log_level(level)
+
+    # Replace any previous setup (module import, or an earlier CLI call).
+    root = logging.getLogger()
+    for existing in list(root.handlers):
+        if isinstance(existing, _DropOnFullQueueHandler):
+            root.removeHandler(existing)
+    if _log_listener is not None:
+        # Tolerate a listener that was already stopped (QueueListener.stop is not
+        # idempotent) so configure_logging can be called any number of times.
+        try:
+            _log_listener.stop()
+        except (AttributeError, RuntimeError):
+            pass
+        _log_listener = None
+    if isinstance(_log_stream_handler, logging.FileHandler):
+        # StreamHandler.close() would close sys.stderr, so only close real files.
+        _log_stream_handler.close()
+    _log_stream_handler = None
+
+    if log_file:
+        handler: logging.Handler = logging.handlers.RotatingFileHandler(
+            log_file, maxBytes=10 * 1024 * 1024, backupCount=5
+        )
+    else:
+        handler = logging.StreamHandler()  # stderr
+    handler.setFormatter(logging.Formatter(_LOG_FORMAT, datefmt=_LOG_DATEFMT))
+
+    record_queue: queue.Queue = queue.Queue(maxsize=_LOG_QUEUE_SIZE)
+    listener = logging.handlers.QueueListener(record_queue, handler)
+    listener.start()  # daemon thread
+
+    # The handler is the last hop, so it must not filter: verbosity is decided
+    # entirely by logger levels above. That is what lets startup lines from
+    # ``LOG_NAME`` through even when the routine/third-party gate stays at WARNING.
+    queue_handler = _DropOnFullQueueHandler(record_queue)
+    queue_handler.setLevel(logging.NOTSET)
+    root.addHandler(queue_handler)
+
+    # Gate third-party loggers: anything with no explicit level inherits this.
+    root.setLevel(resolved)
+    for name in _NOISY_LOGGERS:
+        logging.getLogger(name).setLevel(resolved)
+    # Startup/lifecycle shares the same sink but stays audible.
+    logging.getLogger(LOG_NAME).setLevel(min(resolved, logging.INFO))
+    # Routine per-request logging is opt-in.
+    logging.getLogger(REQUEST_LOG_NAME).setLevel(resolved)
+
+    _log_listener = listener
+    _log_stream_handler = handler
+    return listener
+
+
+configure_logging(DEFAULT_LOG_LEVEL)
+log = logging.getLogger(LOG_NAME)
+# Routine per-request/job logging (suppressed unless --log-level enables it).
+req_log = logging.getLogger(REQUEST_LOG_NAME)
 
 # Commands can be huge (whole scripts); log only a prefix so logs stay small.
 _LOG_COMMAND_MAX_CHARS = 300
@@ -165,6 +278,12 @@ class Config:
     cleanup_interval_seconds: float = 60.0
     cwd: str = field(default_factory=os.getcwd)
     allowed_hosts: tuple = ()
+    # Logging: routine request/job + third-party logging is gated by this level
+    # (default WARNING, so the stderr pipe does not fill). Startup lines, warnings
+    # and errors are always emitted regardless.
+    log_level: str = DEFAULT_LOG_LEVEL
+    # Optional rotating log file; when set, records go here instead of stderr.
+    log_file: str | None = None
 
 
 def _positive_float(value: Any, default: float) -> float:
@@ -209,6 +328,23 @@ def parse_args() -> Config:
     p.add_argument("--cwd", default=os.getcwd(), help="Working directory for executed commands")
     p.add_argument("--allowed-host", action="append", default=[],
                    help="Extra Host header to accept when behind a proxy/tunnel, e.g. shell-mcp-proxy.example.com (repeatable)")
+    p.add_argument(
+        "--log-level",
+        default=DEFAULT_LOG_LEVEL,
+        choices=["critical", "error", "warning", "info", "debug"],
+        help=(
+            "Verbosity of routine request/job logging (default: warning). At the default, "
+            "only startup lines, warnings and errors are written, so a stderr pipe that is "
+            "never drained does not fill up with access logs. Raise to 'info' to log every "
+            "tool call; raise to 'debug' to also include third-party (MCP SDK/uvicorn/httpx) "
+            "request logging."
+        ),
+    )
+    p.add_argument(
+        "--log-file",
+        default=None,
+        help="Write logs to this rotating file instead of stderr. Useful when stderr is not being drained.",
+    )
     a = p.parse_args()
 
     cfg = Config(
@@ -222,6 +358,8 @@ def parse_args() -> Config:
         max_jobs=a.max_jobs,
         cwd=a.cwd,
         allowed_hosts=tuple(a.allowed_host),
+        log_level=a.log_level,
+        log_file=a.log_file,
     )
     if not cfg.no_auth and not cfg.token:
         cfg.token = secrets.token_urlsafe(24)
@@ -342,7 +480,7 @@ class Job:
                     self._timer.cancel()
                     self._timer = None
 
-        log.info("JOB START   | id=%s | pid=%s | command=%s", self.job_id, self.pid, _clip(self.command))
+        req_log.info("JOB START   | id=%s | pid=%s | command=%s", self.job_id, self.pid, _clip(self.command))
 
     def _pump(self, stream, is_stdout: bool) -> None:
         """Drain one pipe. Keeps a bounded character prefix but reads to EOF.
@@ -841,7 +979,7 @@ class ShellService:
                 removed = self.manager.cleanup(self.cfg)
                 self.sweep_uploads()
                 if removed:
-                    log.info("CLEANUP     | reaped %d expired job(s)", removed)
+                    req_log.info("CLEANUP     | reaped %d expired job(s)", removed)
             except Exception:  # noqa: BLE001 - reaper must never die
                 log.exception("Job cleanup reaper error")
 
@@ -856,7 +994,7 @@ class ShellService:
         wait = _resolve_wait_seconds(self.cfg, wait_seconds)
         max_runtime = _resolve_max_runtime(self.cfg, timeout_seconds)
 
-        log.info(
+        req_log.info(
             "EXEC REQUEST | cwd=%s | wait=%ss | max_runtime=%ss | command=%s",
             self.cfg.cwd, wait, max_runtime or "unlimited", _clip(command),
         )
@@ -867,7 +1005,7 @@ class ShellService:
         if not finished:
             result["note"] = self._running_note(job)
 
-        log.info(
+        req_log.info(
             "EXEC RESULT  | id=%s | status=%s | exit_code=%s | duration=%ss | stdout_len=%d | stderr_len=%d",
             job.job_id, result["status"], result["exit_code"], result["duration_seconds"],
             len(result["stdout"]), len(result["stderr"]),
@@ -957,7 +1095,7 @@ class ShellService:
         finally:
             if os.path.exists(tmp):
                 os.remove(tmp)
-        log.info("UPLOAD      | path=%s | bytes=%d | overwritten=%s", target, len(data), existed)
+        req_log.info("UPLOAD      | path=%s | bytes=%d | overwritten=%s", target, len(data), existed)
         return {
             "path": target,
             "bytes": len(data),
@@ -983,7 +1121,7 @@ class ShellService:
             self._uploads[upload_id] = _UploadSession(
                 target=target, tmp=tmp, overwrite=overwrite, executable=executable
             )
-        log.info("UPLOAD BEGIN| id=%s | path=%s", upload_id, target)
+        req_log.info("UPLOAD BEGIN| id=%s | path=%s", upload_id, target)
         return {"upload_id": upload_id, "path": target, "chunk_max_bytes": UPLOAD_CHUNK_MAX_BYTES}
 
     def _get_upload(self, upload_id: str) -> _UploadSession:
@@ -1056,7 +1194,7 @@ class ShellService:
             size = session.received
         with self._uploads_lock:
             self._uploads.pop(upload_id, None)
-        log.info("UPLOAD DONE | id=%s | path=%s | bytes=%d | overwritten=%s", upload_id, session.target, size, existed)
+        req_log.info("UPLOAD DONE | id=%s | path=%s | bytes=%d | overwritten=%s", upload_id, session.target, size, existed)
         return {
             "path": session.target,
             "bytes": size,
@@ -1076,7 +1214,7 @@ class ShellService:
             session.closed = True
             if os.path.exists(session.tmp):
                 os.remove(session.tmp)
-        log.info("UPLOAD ABORT| id=%s | path=%s", upload_id, session.target)
+        req_log.info("UPLOAD ABORT| id=%s | path=%s", upload_id, session.target)
         return {"upload_id": upload_id, "aborted": True}
 
     def sweep_uploads(self, max_idle: float = UPLOAD_IDLE_TIMEOUT_SECONDS) -> int:
@@ -1213,7 +1351,7 @@ class ShellService:
         if rc != 0:
             raise RuntimeError(f"git push failed: {err or out}")
 
-        log.info("GIT PUSH    | repo=%s | branch=%s | committed=%s | commit=%s", repo, branch, has_changes, commit_sha)
+        req_log.info("GIT PUSH    | repo=%s | branch=%s | committed=%s | commit=%s", repo, branch, has_changes, commit_sha)
         return {
             "repo": repo,
             "branch": branch,
@@ -1492,7 +1630,10 @@ def build_app(cfg: Config):
 
 def main() -> None:
     cfg = parse_args()
+    # Apply the selected logging setup before any startup line is emitted.
+    configure_logging(cfg.log_level, cfg.log_file)
     log.info("Starting MCP shell server on http://%s:%s/mcp", cfg.host, cfg.port)
+    log.info("Log level: %s%s", _log_level_name(cfg.log_level), f" -> {cfg.log_file}" if cfg.log_file else "")
     log.info("Working directory for commands: %s", cfg.cwd)
     log.info(
         "Sync wait window: %ss | max runtime: %s | retention: %ss",
@@ -1514,7 +1655,20 @@ def main() -> None:
     try:
         import uvicorn
 
-        uvicorn.run(app, host=cfg.host, port=cfg.port, log_level="warning")
+        # log_config=None keeps uvicorn from installing its own stderr/stdout
+        # handlers, so everything flows through our single queue handler.
+        # access_log=False stops the per-request access line (which uvicorn writes
+        # to stdout); errors still surface via the "uvicorn.error" logger, which
+        # our root handler captures at the configured level. log_level mirrors the
+        # CLI choice so uvicorn's own loggers match (quiet by default).
+        uvicorn.run(
+            app,
+            host=cfg.host,
+            port=cfg.port,
+            log_config=None,
+            access_log=False,
+            log_level=_log_level_name(cfg.log_level),
+        )
     finally:
         service.shutdown()
 
