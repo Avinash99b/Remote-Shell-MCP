@@ -53,6 +53,10 @@ def test_default_level_is_warning():
     assert srv.DEFAULT_LOG_LEVEL == "warning"
     assert srv.Config().log_level == "warning"
     assert srv.Config().log_file is None
+    assert srv.Config().stateless_http is True
+    assert srv.Config().json_response is False
+    assert srv.Config().sdk_debug is False
+    assert srv.Config().debug_payloads is False
 
 
 def test_routine_request_logging_suppressed_by_default(tmp_path):
@@ -188,13 +192,77 @@ def test_parse_args_log_defaults(monkeypatch, tmp_path):
     cfg = srv.parse_args()
     assert cfg.log_level == "warning"
     assert cfg.log_file is None
+    assert cfg.stateless_http is True
+    assert cfg.json_response is False
+    assert cfg.sdk_debug is False
+    assert cfg.debug_payloads is False
 
 
 def test_parse_args_log_overrides(monkeypatch, tmp_path):
     monkeypatch.setattr(
         "sys.argv",
-        ["mcp_shell_server.py", "--log-level", "info", "--log-file", str(tmp_path / "s.log")],
+        [
+            "mcp_shell_server.py",
+            "--log-level",
+            "debug",
+            "--log-file",
+            str(tmp_path / "s.log"),
+            "--stateful",
+            "--json-response",
+            "--sdk-debug",
+            "--debug-payloads",
+        ],
     )
     cfg = srv.parse_args()
-    assert cfg.log_level == "info"
+    assert cfg.log_level == "debug"
     assert cfg.log_file == str(tmp_path / "s.log")
+    assert cfg.stateless_http is False
+    assert cfg.json_response is True
+    assert cfg.sdk_debug is True
+    assert cfg.debug_payloads is True
+
+
+def test_debug_level_keeps_sse_and_wire_quiet_by_default(tmp_path):
+    """When a notebook overrides --log-level debug, sse_starlette and SDK payloads must not dump."""
+    srv.configure_logging("debug", str(tmp_path / "log.txt"))
+    # Server's own debug is enabled
+    assert logging.getLogger(srv.REQUEST_LOG_NAME).isEnabledFor(logging.DEBUG)
+    # sse_starlette must NOT be at DEBUG (prevents full SSE chunk dumps)
+    assert not logging.getLogger("sse_starlette").isEnabledFor(logging.DEBUG)
+    assert logging.getLogger("sse_starlette").isEnabledFor(logging.WARNING)
+    # mcp SDK is capped at INFO (allows compact request tracing, prevents message payload dumps)
+    assert logging.getLogger("mcp").isEnabledFor(logging.INFO)
+    assert not logging.getLogger("mcp.server.lowlevel.server").isEnabledFor(logging.DEBUG)
+
+
+def test_explicit_debug_payloads_enables_sse(tmp_path):
+    srv.configure_logging("debug", str(tmp_path / "log.txt"), debug_payloads=True)
+    assert logging.getLogger("sse_starlette").isEnabledFor(logging.DEBUG)
+
+
+def test_explicit_sdk_debug_enables_mcp_debug(tmp_path):
+    srv.configure_logging("debug", str(tmp_path / "log.txt"), sdk_debug=True)
+    assert logging.getLogger("mcp").isEnabledFor(logging.DEBUG)
+
+
+def test_large_log_record_is_clipped():
+    """Any huge string/arg in a log record is bounded before reaching the queue."""
+    q: queue.Queue = queue.Queue(maxsize=10)
+    handler = srv._DropOnFullQueueHandler(q, allow_payloads=False, max_record_chars=50)
+    huge_msg = "A" * 500
+    rec = _record("test", logging.INFO, huge_msg)
+    handler.enqueue(rec)
+    queued = q.get_nowait()
+    assert len(queued.msg) < 100
+    assert "chars clipped" in queued.msg
+
+
+def test_sse_chunk_record_dropped_by_filter():
+    """DEBUG records from sse_starlette are rejected by the filter unless allow_payloads=True."""
+    q: queue.Queue = queue.Queue(maxsize=10)
+    handler = srv._DropOnFullQueueHandler(q, allow_payloads=False)
+    rec = _record("sse_starlette", logging.DEBUG, "chunk: data: ...")
+    assert handler.filter(rec) is False
+
+    handler_allowed = srv._DropOnFullQueueHandler(q, allow_payloads=True)
+    assert handler_allowed.filter(rec) is True

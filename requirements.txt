@@ -1,3 +1,6 @@
-mcp[cli]>=1.2.0,<2
-starlette>=0.37
-uvicorn>=0.29
+mcp[cli]==1.30.0
+starlette==1.8.0
+uvicorn==0.54.0
+sse-starlette==3.5.0
+anyio==4.15.1
+httpx==0.28.1

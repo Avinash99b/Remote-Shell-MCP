@@ -59,7 +59,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
-import binascii
 import codecs
 import hashlib
 import logging
@@ -115,13 +114,66 @@ DEFAULT_LOG_LEVEL = "warning"
 _LOG_QUEUE_SIZE = 10_000
 _LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
 _LOG_DATEFMT = "%Y-%m-%d %H:%M:%S"
-# Third-party loggers that are chatty at INFO. Gating them explicitly is
+# Max characters for a single logged payload/message to prevent debug amplification.
+_LOG_MAX_CHARS = 2048
+# Third-party loggers that can be chatty or dump payloads. Gating them explicitly is
 # belt-and-braces on top of the root logger level, which normally covers them.
-_NOISY_LOGGERS = ("mcp", "uvicorn", "uvicorn.error", "uvicorn.access", "httpx", "httpcore")
+_NOISY_LOGGERS = (
+    "mcp",
+    "mcp.server",
+    "mcp.server.lowlevel.server",
+    "mcp.server.streamable_http",
+    "sse_starlette",
+    "starlette",
+    "uvicorn",
+    "uvicorn.error",
+    "uvicorn.access",
+    "httpx",
+    "httpcore",
+)
+
+
+def _clip_log_obj(obj: Any, limit: int = _LOG_MAX_CHARS) -> Any:
+    if isinstance(obj, str):
+        if len(obj) > limit:
+            return f"{obj[:limit]}... [+{len(obj) - limit} chars clipped]"
+        return obj
+    if isinstance(obj, (bytes, bytearray)):
+        if len(obj) > limit:
+            head = obj[:limit].decode("utf-8", "replace")
+            return f"{head}... [+{len(obj) - limit} bytes clipped]"
+        return obj
+    return obj
 
 
 class _DropOnFullQueueHandler(logging.handlers.QueueHandler):
+    def __init__(
+        self,
+        queue: queue.Queue,
+        allow_payloads: bool = False,
+        max_record_chars: int = _LOG_MAX_CHARS,
+    ) -> None:
+        super().__init__(queue)
+        self.allow_payloads = allow_payloads
+        self.max_record_chars = max_record_chars
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not super().filter(record):
+            return False
+        # Prevent SSE chunk dumps from sse_starlette unless allow_payloads is explicitly enabled
+        if not self.allow_payloads and record.name == "sse_starlette" and record.levelno <= logging.DEBUG:
+            return False
+        return True
+
     def enqueue(self, record: logging.LogRecord) -> None:
+        if not self.allow_payloads:
+            if isinstance(record.msg, (str, bytes)):
+                record.msg = _clip_log_obj(record.msg, self.max_record_chars)
+            if record.args:
+                if isinstance(record.args, tuple):
+                    record.args = tuple(_clip_log_obj(a, self.max_record_chars) for a in record.args)
+                elif isinstance(record.args, dict):
+                    record.args = {k: _clip_log_obj(v, self.max_record_chars) for k, v in record.args.items()}
         try:
             self.queue.put_nowait(record)
         except queue.Full:
@@ -151,7 +203,10 @@ _log_stream_handler: logging.Handler | None = None
 
 
 def configure_logging(
-    level: object = DEFAULT_LOG_LEVEL, log_file: str | None = None
+    level: object = DEFAULT_LOG_LEVEL,
+    log_file: str | None = None,
+    sdk_debug: bool = False,
+    debug_payloads: bool = False,
 ) -> logging.handlers.QueueListener:
     """Install queue-backed logging. Idempotent and safe to call repeatedly.
 
@@ -196,14 +251,42 @@ def configure_logging(
     # The handler is the last hop, so it must not filter: verbosity is decided
     # entirely by logger levels above. That is what lets startup lines from
     # ``LOG_NAME`` through even when the routine/third-party gate stays at WARNING.
-    queue_handler = _DropOnFullQueueHandler(record_queue)
+    queue_handler = _DropOnFullQueueHandler(record_queue, allow_payloads=debug_payloads)
     queue_handler.setLevel(logging.NOTSET)
     root.addHandler(queue_handler)
 
-    # Gate third-party loggers: anything with no explicit level inherits this.
+    # Gate third-party loggers: prevent debug/payload amplification by default
     root.setLevel(resolved)
-    for name in _NOISY_LOGGERS:
-        logging.getLogger(name).setLevel(resolved)
+
+    if resolved == logging.DEBUG:
+        # User requested DEBUG for the server. Keep noisy third parties safe unless explicitly enabled:
+        mcp_level = logging.DEBUG if sdk_debug else logging.INFO
+        sse_level = logging.DEBUG if debug_payloads else logging.WARNING
+        uvicorn_level = logging.INFO
+        access_level = logging.WARNING
+        http_level = logging.DEBUG if sdk_debug else logging.WARNING
+    elif resolved == logging.INFO:
+        mcp_level = logging.INFO
+        sse_level = logging.WARNING
+        uvicorn_level = logging.INFO
+        access_level = logging.WARNING
+        http_level = logging.WARNING
+    else:  # WARNING or higher
+        mcp_level = resolved
+        sse_level = resolved
+        uvicorn_level = resolved
+        access_level = resolved
+        http_level = resolved
+
+    for name in ("mcp", "mcp.server", "mcp.server.lowlevel.server", "mcp.server.streamable_http"):
+        logging.getLogger(name).setLevel(mcp_level)
+    logging.getLogger("sse_starlette").setLevel(sse_level)
+    for name in ("uvicorn", "uvicorn.error"):
+        logging.getLogger(name).setLevel(uvicorn_level)
+    logging.getLogger("uvicorn.access").setLevel(access_level)
+    for name in ("httpx", "httpcore", "starlette"):
+        logging.getLogger(name).setLevel(http_level)
+
     # Startup/lifecycle shares the same sink but stays audible.
     logging.getLogger(LOG_NAME).setLevel(min(resolved, logging.INFO))
     # Routine per-request logging is opt-in.
@@ -262,6 +345,13 @@ class Config:
     port: int = 8765
     token: str | None = None
     no_auth: bool = False
+    # Use stateless HTTP transport by default to avoid abandoned sessions over tunnels/proxies
+    stateless_http: bool = True
+    # Return standard application/json directly instead of SSE streaming
+    json_response: bool = False
+    # Explicit debug options (prevent debug/payload amplification by default)
+    sdk_debug: bool = False
+    debug_payloads: bool = False
     # How long a request waits for completion before returning a job handle.
     wait_seconds: float = MAX_SYNC_WAIT_SECONDS
     # Hard per-command execution limit. 0 == unlimited (do not kill long jobs).
@@ -329,6 +419,43 @@ def parse_args() -> Config:
     p.add_argument("--allowed-host", action="append", default=[],
                    help="Extra Host header to accept when behind a proxy/tunnel, e.g. shell-mcp-proxy.example.com (repeatable)")
     p.add_argument(
+        "--stateless",
+        dest="stateless_http",
+        action="store_true",
+        default=True,
+        help="Use stateless HTTP transport (default: True, avoids abandoned sessions over tunnels)",
+    )
+    p.add_argument(
+        "--stateful",
+        dest="stateless_http",
+        action="store_false",
+        help="Use stateful HTTP transport instead of stateless",
+    )
+    p.add_argument(
+        "--no-stateless",
+        dest="stateless_http",
+        action="store_false",
+        help=argparse.SUPPRESS,
+    )
+    p.add_argument(
+        "--json-response",
+        action="store_true",
+        default=False,
+        help="Return standard JSON responses instead of SSE streaming (default: False)",
+    )
+    p.add_argument(
+        "--sdk-debug",
+        action="store_true",
+        default=False,
+        help="Enable verbose MCP SDK debug logging (default: False, keeps SDK at safe levels)",
+    )
+    p.add_argument(
+        "--debug-payloads",
+        action="store_true",
+        default=False,
+        help="Allow logging of full message payloads and SSE chunks (default: False, prevents amplification)",
+    )
+    p.add_argument(
         "--log-level",
         default=DEFAULT_LOG_LEVEL,
         choices=["critical", "error", "warning", "info", "debug"],
@@ -352,6 +479,10 @@ def parse_args() -> Config:
         port=a.port,
         token=a.token,
         no_auth=a.no_auth,
+        stateless_http=a.stateless_http,
+        json_response=a.json_response,
+        sdk_debug=a.sdk_debug,
+        debug_payloads=a.debug_payloads,
         wait_seconds=_positive_float(a.timeout, MAX_SYNC_WAIT_SECONDS),
         max_runtime_seconds=_positive_float(a.max_runtime, 0.0),
         job_retention_seconds=_positive_float(a.job_retention, 900.0),
@@ -954,6 +1085,7 @@ class ShellService:
     def __init__(self, cfg: Config, manager: JobManager | None = None) -> None:
         self.cfg = cfg
         self.manager = manager if manager is not None else JobManager()
+        self._start_time = time.monotonic()
         self._stop_cleanup = threading.Event()
         self._reaper: threading.Thread | None = None
         self._reaper_started = False
@@ -1015,6 +1147,7 @@ class ShellService:
     async def get_job(self, job_id: str, wait_seconds: float = 0.0) -> dict[str, Any]:
         job = self.manager.get(self.cfg, job_id)
         if job is None:
+            req_log.info("JOB QUERY   | id=%s | found=False", job_id)
             return {"found": False, "error": f"unknown job_id: {job_id}", "job_id": job_id}
 
         wait = _resolve_wait_seconds(self.cfg, wait_seconds)
@@ -1022,20 +1155,24 @@ class ShellService:
             await _await_job(job, wait)
         result = job.snapshot()
         result["found"] = True
+        req_log.info("JOB QUERY   | id=%s | found=True | status=%s", job_id, result["status"])
         return result
 
     async def list_jobs(self) -> dict[str, Any]:
         jobs = self.manager.list(self.cfg)
         summaries = [j.summary() for j in jobs]
+        running_count = sum(1 for s in summaries if s["running"])
+        req_log.info("JOB LIST    | count=%d | running=%d", len(summaries), running_count)
         return {
             "jobs": summaries,
             "count": len(summaries),
-            "running": sum(1 for s in summaries if s["running"]),
+            "running": running_count,
         }
 
     async def terminate_job(self, job_id: str, grace_seconds: float = 2.0) -> dict[str, Any]:
         job = self.manager.get(self.cfg, job_id)
         if job is None:
+            req_log.info("JOB TERM    | id=%s | found=False", job_id)
             return {"found": False, "error": f"unknown job_id: {job_id}", "job_id": job_id}
         if not job.done.is_set():
             job.terminate()
@@ -1044,12 +1181,48 @@ class ShellService:
                 await _await_job(job, grace)
         result = job.snapshot()
         result["found"] = True
+        req_log.info("JOB TERM    | id=%s | found=True | status=%s", job_id, result["status"])
         return result
 
     async def cleanup_jobs(self, older_than_seconds: float | None = None) -> dict[str, Any]:
         removed = self.manager.cleanup(self.cfg, older_than_seconds)
         remaining = len(self.manager.list(self.cfg))
         return {"removed": removed, "count": remaining}
+
+    async def get_diagnostics(self) -> dict[str, Any]:
+        result = await asyncio.to_thread(self._get_diagnostics)
+        req_log.info(
+            "DIAGNOSTICS | uptime=%ss | active_jobs=%d | retained_jobs=%d | uploads=%d | rss_mb=%s",
+            result["uptime_seconds"], result["active_jobs"], result["retained_jobs"],
+            result["active_uploads"], result["max_rss_mb"] or "unknown",
+        )
+        return result
+
+    def _get_diagnostics(self) -> dict[str, Any]:
+        jobs = self.manager.list(self.cfg)
+        running_jobs = sum(1 for j in jobs if j.running)
+        with self._uploads_lock:
+            active_uploads = len(self._uploads)
+
+        max_rss_mb: float | None = None
+        try:
+            import resource
+            max_rss_mb = round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0, 1)
+        except Exception:
+            pass
+
+        return {
+            "status": "ok",
+            "uptime_seconds": round(time.monotonic() - self._start_time, 1),
+            "pid": os.getpid(),
+            "stateless_http": self.cfg.stateless_http,
+            "json_response": self.cfg.json_response,
+            "active_jobs": running_jobs,
+            "retained_jobs": len(jobs),
+            "active_uploads": active_uploads,
+            "max_rss_mb": max_rss_mb,
+            "cwd": self.cfg.cwd,
+        }
 
     def shutdown(self) -> None:
         self._stop_cleanup.set()
@@ -1165,6 +1338,7 @@ class ShellService:
                 session.sha.update(new)
                 session.received = end
             session.last_active = time.monotonic()
+            req_log.info("UPLOAD CHUNK| id=%s | offset=%d | bytes=%d", upload_id, offset, len(data))
             return {"upload_id": upload_id, "received_bytes": session.received}
 
     async def finish_upload(self, upload_id: str, expected_sha256: str | None = None) -> dict[str, Any]:
@@ -1249,12 +1423,14 @@ class ShellService:
                 raise ValueError(f"offset {offset} is past the end of the file ({total} bytes)")
             fh.seek(offset)
             data = fh.read(length)
+        is_eof = offset + len(data) >= total
+        req_log.info("DOWNLOAD    | path=%s | offset=%d | bytes=%d | eof=%s", target, offset, len(data), is_eof)
         return {
             "path": target,
             "offset": offset,
             "bytes": len(data),
             "total_bytes": total,
-            "eof": offset + len(data) >= total,
+            "eof": is_eof,
             "content_base64": base64.b64encode(data).decode("ascii"),
         }
 
@@ -1541,6 +1717,15 @@ Returns:
 """
 
 
+get_diagnostics_doc = """
+Return safe compact server diagnostics (status, active jobs, uptime, memory) with no sensitive payloads.
+
+Returns:
+    A dict including: status, uptime_seconds, pid, stateless_http, json_response,
+    active_jobs, retained_jobs, active_uploads, max_rss_mb, cwd.
+"""
+
+
 # --------------------------------------------------------------------------
 # Server construction
 # --------------------------------------------------------------------------
@@ -1571,6 +1756,8 @@ def build_server(service: ShellService) -> FastMCP:
         host=service.cfg.host,
         port=service.cfg.port,
         transport_security=_transport_security(service.cfg),
+        stateless_http=service.cfg.stateless_http,
+        json_response=service.cfg.json_response,
         # The SDK default is 4 MiB per HTTP request body. A chunk of UPLOAD_CHUNK_MAX_BYTES
         # is about 11 MiB once base64-encoded, so raise the limit to fit one chunk plus JSON
         # framing. It stays finite, so one request still cannot exhaust memory.
@@ -1581,6 +1768,7 @@ def build_server(service: ShellService) -> FastMCP:
     server.add_tool(service.list_jobs, description=list_jobs_doc)
     server.add_tool(service.terminate_job, description=terminate_job_doc)
     server.add_tool(service.cleanup_jobs, description=cleanup_jobs_doc)
+    server.add_tool(service.get_diagnostics, description=get_diagnostics_doc)
     server.add_tool(service.upload_file, description=upload_file_doc)
     server.add_tool(service.download_file, description=download_file_doc)
     server.add_tool(service.begin_upload, description=begin_upload_doc)
@@ -1605,7 +1793,7 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next):
         cfg = self._cfg
-        if cfg.no_auth or request.method == "OPTIONS":
+        if cfg.no_auth or request.method == "OPTIONS" or request.url.path == "/health":
             return await call_next(request)
 
         auth = request.headers.get("authorization", "")
@@ -1624,6 +1812,11 @@ def build_app(cfg: Config):
     SERVICE.start_reaper()
     app = build_server(SERVICE).streamable_http_app()
     app.state.shell_service = SERVICE
+
+    async def health_endpoint(request: Request) -> JSONResponse:
+        return JSONResponse(SERVICE._get_diagnostics())
+
+    app.add_route("/health", health_endpoint, methods=["GET"])
     app.add_middleware(BearerAuthMiddleware, cfg)
     return app
 
@@ -1631,9 +1824,12 @@ def build_app(cfg: Config):
 def main() -> None:
     cfg = parse_args()
     # Apply the selected logging setup before any startup line is emitted.
-    configure_logging(cfg.log_level, cfg.log_file)
+    configure_logging(cfg.log_level, cfg.log_file, sdk_debug=cfg.sdk_debug, debug_payloads=cfg.debug_payloads)
     log.info("Starting MCP shell server on http://%s:%s/mcp", cfg.host, cfg.port)
     log.info("Log level: %s%s", _log_level_name(cfg.log_level), f" -> {cfg.log_file}" if cfg.log_file else "")
+    log.info("HTTP transport: %s | JSON response: %s", "stateless" if cfg.stateless_http else "stateful", cfg.json_response)
+    if cfg.sdk_debug or cfg.debug_payloads:
+        log.warning("Verbose wire/payload debug enabled: sdk_debug=%s, debug_payloads=%s", cfg.sdk_debug, cfg.debug_payloads)
     log.info("Working directory for commands: %s", cfg.cwd)
     log.info(
         "Sync wait window: %ss | max runtime: %s | retention: %ss",
@@ -1701,6 +1897,10 @@ async def terminate_job(job_id: str, grace_seconds: float = 2.0) -> dict[str, An
 
 async def cleanup_jobs(older_than_seconds: float | None = None) -> dict[str, Any]:
     return await SERVICE.cleanup_jobs(older_than_seconds)
+
+
+async def get_diagnostics() -> dict[str, Any]:
+    return await SERVICE.get_diagnostics()
 
 
 if __name__ == "__main__":

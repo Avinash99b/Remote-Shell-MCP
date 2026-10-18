@@ -499,3 +499,19 @@ def test_build_server_uses_its_own_service(tmp_path):
     anyio.run(scenario)
     svc_a.shutdown()
     svc_b.shutdown()
+
+
+def test_get_diagnostics(service):
+    server = srv.build_server(service)
+
+    async def scenario():
+        async with create_connected_server_and_client_session(server, raise_exceptions=False) as client:
+            res = await client.call_tool("get_diagnostics", {})
+            diag = res.structuredContent
+            assert diag["status"] == "ok"
+            assert isinstance(diag["pid"], int)
+            assert diag["active_jobs"] == 0
+            assert diag["stateless_http"] is True
+            assert diag["json_response"] is False
+
+    anyio.run(scenario)

@@ -196,6 +196,72 @@ def test_http_disconnect_does_not_kill_job(http_server):
     job.wait_done(3.0)
 
 
+def test_http_diagnostics_tool(http_server):
+    async def scenario():
+        async with streamablehttp_client(http_server) as (read, write, _):
+            async with ClientSession(read, write) as client:
+                await client.initialize()
+                res = await client.call_tool("get_diagnostics", {})
+                diag = res.structuredContent
+                assert diag["status"] == "ok"
+                assert isinstance(diag["uptime_seconds"], (int, float))
+                assert diag["stateless_http"] is True
+
+    anyio.run(scenario)
+
+
+def test_http_health_endpoint(http_server):
+    import httpx
+
+    # http_server is e.g. http://127.0.0.1:{port}/mcp
+    base_url = http_server.rsplit("/", 1)[0]
+    r = httpx.get(f"{base_url}/health", timeout=5.0)
+    assert r.status_code == 200
+    data = r.json()
+    assert data["status"] == "ok"
+    assert "pid" in data
+    assert "stateless_http" in data
+
+
+def test_http_stateful_mode(tmp_path):
+    """Verify that stateful HTTP mode is still configurable and operational."""
+    port = _free_port()
+    cfg = srv.Config(
+        host="127.0.0.1",
+        port=port,
+        no_auth=True,
+        stateless_http=False,
+        cwd=str(tmp_path),
+        cleanup_interval_seconds=0.0,
+    )
+    saved_cfg, saved_service = srv.CFG, srv.SERVICE
+    app = srv.build_app(cfg)
+    service = app.state.shell_service
+    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
+    server = uvicorn.Server(config)
+    thread = threading.Thread(target=server.run, daemon=True, name="uvicorn-stateful-test")
+    thread.start()
+    deadline = time.time() + 15
+    while not server.started and time.time() < deadline:
+        time.sleep(0.05)
+    assert server.started
+
+    async def scenario():
+        async with streamablehttp_client(f"http://127.0.0.1:{port}/mcp") as (read, write, _):
+            async with ClientSession(read, write) as client:
+                await client.initialize()
+                res = await client.call_tool("run_shell_command", {"command": "echo stateful-ok"})
+                assert res.structuredContent["stdout"].strip() == "stateful-ok"
+
+    try:
+        anyio.run(scenario)
+    finally:
+        server.should_exit = True
+        thread.join(timeout=10)
+        service.shutdown()
+        srv.CFG, srv.SERVICE = saved_cfg, saved_service
+
+
 @pytest.mark.slow
 def test_http_60s_transition_default(http_server):
     """Default (no wait_seconds) must cap at 60s and hand back a job id."""
