@@ -61,6 +61,7 @@ import asyncio
 import base64
 import codecs
 import hashlib
+import json
 import logging
 import logging.handlers
 import math
@@ -68,19 +69,23 @@ import os
 import queue
 import secrets
 import select
+import shutil
 import signal
+import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 import anyio
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.types import CallToolResult, ImageContent, TextContent
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -1073,6 +1078,126 @@ def _decode_chunk(content_base64: str) -> bytes:
         raise ValueError(f"content_base64 is not valid base64: {e}") from e
 
 
+# --------------------------------------------------------------------------
+# Screenshot backends
+# --------------------------------------------------------------------------
+# Screenshots are taken by shelling out to whichever CLI capture tool is already
+# installed on the host; there are no Python image dependencies. Backends are
+# tried in priority order (or just the forced one) until one produces a file.
+# Every command is passed as an argv list — never through a shell.
+SCREENSHOT_DEFAULT_TIMEOUT = 20.0
+
+# Output extension -> (format, mime type). Any other extension is treated as
+# "unknown" with an opaque mime type rather than guessing.
+_SCREENSHOT_FORMATS: dict[str, tuple[str, str]] = {
+    ".png": ("png", "image/png"),
+    ".jpg": ("jpeg", "image/jpeg"),
+    ".jpeg": ("jpeg", "image/jpeg"),
+    ".webp": ("webp", "image/webp"),
+    ".gif": ("gif", "image/gif"),
+    ".bmp": ("bmp", "image/bmp"),
+    ".tif": ("tiff", "image/tiff"),
+    ".tiff": ("tiff", "image/tiff"),
+    ".ppm": ("ppm", "image/x-portable-pixmap"),
+    ".pnm": ("pnm", "image/x-portable-anymap"),
+}
+
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+
+def _png_dimensions(data: bytes) -> tuple[int, int] | None:
+    """Return ``(width, height)`` from a PNG IHDR header, or None.
+
+    Standard library only: the PNG signature is followed by the IHDR chunk whose
+    first 8 payload bytes are width and height as big-endian uint32.
+    """
+    if len(data) >= 24 and data[:8] == _PNG_SIGNATURE and data[12:16] == b"IHDR":
+        width, height = struct.unpack(">II", data[16:24])
+        return int(width), int(height)
+    return None
+
+
+def _screenshot_format(target: str) -> tuple[str, str]:
+    """Map a target path's extension to ``(format, mime_type)``."""
+    ext = os.path.splitext(target)[1].lower()
+    return _SCREENSHOT_FORMATS.get(ext, (ext.lstrip(".") or "unknown", "application/octet-stream"))
+
+
+def _resolve_screenshot_timeout(value: Any, default: float = SCREENSHOT_DEFAULT_TIMEOUT) -> float:
+    """Coerce a per-backend timeout to a finite, positive float or ``default``."""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return default
+    if math.isnan(f) or math.isinf(f) or f <= 0:
+        return default
+    return f
+
+
+@dataclass(frozen=True)
+class _ScreenshotBackend:
+    """One CLI capture backend.
+
+    ``build_argv`` maps ``(target, region)`` to an argv list; the special
+    ``xwd+ffmpeg`` backend has no single argv (it is a two-step pipeline) and
+    leaves it as ``None``. ``extra_binaries`` are additional executables the
+    backend needs besides ``binary``.
+    """
+
+    name: str
+    binary: str
+    supports_region: bool
+    build_argv: Callable[[str, list[int] | None], list[str]] | None
+    extra_binaries: tuple[str, ...] = ()
+
+
+def _argv_scrot(target: str, region: list[int] | None) -> list[str]:
+    if region is None:
+        return ["scrot", "-o", target]
+    x, y, w, h = region
+    return ["scrot", "-a", f"{x},{y},{w},{h}", "-o", target]
+
+
+def _argv_maim(target: str, region: list[int] | None) -> list[str]:
+    if region is None:
+        return ["maim", target]
+    x, y, w, h = region
+    return ["maim", "-g", f"{w}x{h}+{x}+{y}", target]
+
+
+def _argv_grim(target: str, region: list[int] | None) -> list[str]:
+    if region is None:
+        return ["grim", target]
+    x, y, w, h = region
+    return ["grim", "-g", f"{x},{y} {w}x{h}", target]
+
+
+def _argv_gnome_screenshot(target: str, region: list[int] | None) -> list[str]:
+    # gnome-screenshot cannot crop, so this backend is skipped for regions.
+    return ["gnome-screenshot", "-f", target]
+
+
+def _argv_import(target: str, region: list[int] | None) -> list[str]:
+    if region is None:
+        return ["import", "-window", "root", target]
+    x, y, w, h = region
+    return ["import", "-window", "root", "-crop", f"{w}x{h}+{x}+{y}", "+repage", target]
+
+
+# Priority order: dedicated X11/Wayland capture tools first, then ImageMagick,
+# then the always-available-on-X11 xwd -> ffmpeg pipeline.
+_SCREENSHOT_BACKENDS: tuple[_ScreenshotBackend, ...] = (
+    _ScreenshotBackend("scrot", "scrot", True, _argv_scrot),
+    _ScreenshotBackend("maim", "maim", True, _argv_maim),
+    _ScreenshotBackend("grim", "grim", True, _argv_grim),
+    _ScreenshotBackend("gnome-screenshot", "gnome-screenshot", False, _argv_gnome_screenshot),
+    _ScreenshotBackend("import", "import", True, _argv_import),
+    _ScreenshotBackend("xwd+ffmpeg", "xwd", True, None, ("ffmpeg",)),
+)
+
+_SCREENSHOT_BACKENDS_BY_NAME: dict[str, _ScreenshotBackend] = {b.name: b for b in _SCREENSHOT_BACKENDS}
+
+
 class ShellService:
     """Binds one :class:`Config` and :class:`JobManager` to the MCP tool methods.
 
@@ -1538,6 +1663,213 @@ class ShellService:
             "push_output": err or out,
         }
 
+    # -- screenshot ----------------------------------------------------------
+    async def screenshot(
+        self,
+        path: str | None = None,
+        region: list[int] | None = None,
+        backend: str | None = None,
+        display: str | None = None,
+        inline: bool = True,
+        timeout_seconds: float = SCREENSHOT_DEFAULT_TIMEOUT,
+    ) -> CallToolResult:
+        """Capture a screenshot on the host and return it as MCP image content."""
+        region = self._validate_region(region)
+
+        if path is None:
+            target = self._default_screenshot_path()
+        else:
+            target = self._resolve_path(path)
+            # Extension selects the output format; default to PNG when absent.
+            if not os.path.splitext(target)[1]:
+                target += ".png"
+
+        timeout = _resolve_screenshot_timeout(timeout_seconds)
+        effective_display = display if display else os.environ.get("DISPLAY")
+
+        start = time.monotonic()
+        used_backend = await asyncio.to_thread(
+            self._capture_screenshot, target, region, backend, display, timeout
+        )
+        duration = round(time.monotonic() - start, 3)
+
+        with open(target, "rb") as fh:
+            data = fh.read()
+        fmt, mime = _screenshot_format(target)
+
+        metadata: dict[str, Any] = {
+            "path": target,
+            "bytes": len(data),
+            "format": fmt,
+            "mime_type": mime,
+            "backend": used_backend,
+            "region": region,
+            "inline": bool(inline),
+            "display": effective_display,
+            "duration_seconds": duration,
+        }
+        if fmt == "png":
+            dims = _png_dimensions(data)
+            if dims is not None:
+                metadata["width"], metadata["height"] = dims
+
+        content: list[TextContent | ImageContent] = [
+            TextContent(type="text", text=json.dumps(metadata, indent=2))
+        ]
+        if inline and data:
+            content.append(
+                ImageContent(
+                    type="image",
+                    data=base64.b64encode(data).decode("ascii"),
+                    mimeType=mime,
+                )
+            )
+
+        req_log.info(
+            "SCREENSHOT  | backend=%s | path=%s | bytes=%s | inline=%s",
+            used_backend, target, len(data), bool(inline),
+        )
+        return CallToolResult(content=content, structuredContent=metadata, isError=False)
+
+    def _default_screenshot_path(self) -> str:
+        """Unique default destination under the server working directory."""
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        return os.path.join(self.cfg.cwd, f"screenshot-{stamp}-{secrets.token_hex(4)}.png")
+
+    @staticmethod
+    def _validate_region(region: list[int] | None) -> list[int] | None:
+        """Validate an ``[x, y, width, height]`` region, or return None."""
+        if region is None:
+            return None
+        if not isinstance(region, (list, tuple)) or len(region) != 4:
+            raise ValueError("region must be a list of exactly 4 integers: [x, y, width, height]")
+        values: list[int] = []
+        for name, value in zip(("x", "y", "width", "height"), region):
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"region {name} must be an integer, got {value!r}")
+            values.append(value)
+        x, y, width, height = values
+        if x < 0 or y < 0:
+            raise ValueError(f"region x and y must be >= 0, got x={x}, y={y}")
+        if width <= 0 or height <= 0:
+            raise ValueError(f"region width and height must be > 0, got width={width}, height={height}")
+        return values
+
+    def _capture_screenshot(
+        self,
+        target: str,
+        region: list[int] | None = None,
+        backend: str | None = None,
+        display: str | None = None,
+        timeout_seconds: float = SCREENSHOT_DEFAULT_TIMEOUT,
+    ) -> str:
+        """Run the first working capture backend, writing to ``target``.
+
+        Blocking; call via ``asyncio.to_thread``. Returns the name of the backend
+        that succeeded. Raises ``ValueError`` for an unknown forced backend and
+        ``RuntimeError`` when every candidate fails.
+        """
+        env = dict(os.environ)
+        if display:
+            env["DISPLAY"] = display
+
+        parent = os.path.dirname(target)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
+        if backend is not None:
+            if not isinstance(backend, str) or backend not in _SCREENSHOT_BACKENDS_BY_NAME:
+                raise ValueError(
+                    f"unknown screenshot backend {backend!r}; "
+                    f"available: {', '.join(_SCREENSHOT_BACKENDS_BY_NAME)}"
+                )
+            candidates: list[_ScreenshotBackend] = [_SCREENSHOT_BACKENDS_BY_NAME[backend]]
+        else:
+            candidates = list(_SCREENSHOT_BACKENDS)
+
+        attempts: list[str] = []
+        for spec in candidates:
+            if region is not None and not spec.supports_region:
+                attempts.append(f"{spec.name}: skipped (cannot capture a region)")
+                continue
+            missing = [b for b in (spec.binary, *spec.extra_binaries) if shutil.which(b) is None]
+            if missing:
+                attempts.append(f"{spec.name}: not available (missing {', '.join(missing)})")
+                continue
+            try:
+                if spec.name == "xwd+ffmpeg":
+                    self._capture_xwd_ffmpeg(target, region, env, timeout_seconds)
+                else:
+                    assert spec.build_argv is not None  # non-special backends always define argv
+                    argv = spec.build_argv(target, region)
+                    self._run_screenshot_command(argv, env, timeout_seconds)
+                if not os.path.isfile(target) or os.path.getsize(target) <= 0:
+                    raise RuntimeError("command reported success but produced no image file")
+                return spec.name
+            except Exception as e:  # noqa: BLE001 - try the next backend
+                attempts.append(f"{spec.name}: {e}")
+                log.warning("SCREENSHOT BACKEND FAILED | backend=%s | error=%s", spec.name, e)
+                try:
+                    if os.path.isfile(target):
+                        os.remove(target)
+                except OSError:
+                    pass
+
+        detail = "; ".join(attempts) if attempts else "no backends configured"
+        if backend is not None:
+            raise RuntimeError(f"screenshot backend {backend!r} failed: {detail}")
+        raise RuntimeError(
+            "no screenshot backend succeeded. Attempted: "
+            + detail
+            + ". Install one of scrot, maim, grim, gnome-screenshot or ImageMagick "
+            "'import'; on X11 also ensure DISPLAY is set (the xwd+ffmpeg fallback "
+            "additionally needs xwd and ffmpeg)."
+        )
+
+    @staticmethod
+    def _run_screenshot_command(argv: list[str], env: dict[str, str], timeout_seconds: float) -> None:
+        """Run one capture command with no shell; raise RuntimeError on failure."""
+        try:
+            proc = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+                stdin=subprocess.DEVNULL,
+                env=env,
+            )
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(f"timed out after {timeout_seconds:g}s") from e
+        if proc.returncode != 0:
+            err = (proc.stderr or proc.stdout or "").strip()
+            raise RuntimeError(f"exited with code {proc.returncode}: {err[:300] or 'no error output'}")
+
+    @classmethod
+    def _capture_xwd_ffmpeg(
+        cls,
+        target: str,
+        region: list[int] | None,
+        env: dict[str, str],
+        timeout_seconds: float,
+    ) -> None:
+        """X11 fallback: capture an XWD dump with ``xwd``, convert with ``ffmpeg``."""
+        tmp_dir = tempfile.mkdtemp(prefix="mcp-screenshot-")
+        tmp_xwd = os.path.join(tmp_dir, "shot.xwd")
+        try:
+            cls._run_screenshot_command(
+                ["xwd", "-root", "-silent", "-out", tmp_xwd], env, timeout_seconds
+            )
+            if not os.path.isfile(tmp_xwd) or os.path.getsize(tmp_xwd) <= 0:
+                raise RuntimeError("xwd produced no data (is DISPLAY correct?)")
+            argv = ["ffmpeg", "-y", "-loglevel", "error", "-i", tmp_xwd]
+            if region is not None:
+                x, y, w, h = region
+                argv += ["-vf", f"crop={w}:{h}:{x}:{y}"]
+            argv.append(target)
+            cls._run_screenshot_command(argv, env, timeout_seconds)
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
     # -- helpers -------------------------------------------------------------
     @staticmethod
     def validate_command(command: str) -> str:
@@ -1726,6 +2058,45 @@ Returns:
 """
 
 
+screenshot_doc = """
+Capture a screenshot of the host's display and return the image to the model inline.
+
+By default the full screen is captured and the image is returned as a native MCP
+image content block so you can actually see it. The tool writes the image to disk
+on the host and also returns metadata. The capture is offloaded off the event loop.
+
+Backends are auto-detected and tried in priority order (scrot, maim, grim,
+gnome-screenshot, ImageMagick `import`, then an `xwd`+`ffmpeg` fallback for X11)
+until one succeeds, so no particular tool needs to be installed. Use `backend` to
+force a specific one.
+
+Args:
+    path: Destination file. Relative paths resolve against the server's working
+        directory. The extension selects the format (default .png). Omit to write
+        a unique screenshot-<UTC timestamp>-<random>.png in the working directory.
+    region: Optional [x, y, width, height] rectangle to capture instead of the
+        whole screen. x/y must be >= 0; width/height must be > 0.
+    backend: Force a named backend ("scrot", "maim", "grim", "gnome-screenshot",
+        "import", "xwd+ffmpeg"). Unknown or failing backends raise a clear error.
+    display: Optional X11 DISPLAY override (e.g. ":1") for the capture process.
+    inline: When true (default) include the image in the response; when false,
+        return metadata only.
+    timeout_seconds: Per-backend command timeout in seconds (default 20).
+
+Returns:
+    An MCP CallToolResult whose `content` is a text block of pretty-printed JSON
+    metadata (and, when inline and the file was written, an `image` block with the
+    base64 PNG/JPEG bytes), and whose `structuredContent` is the same metadata
+    dict (without the image payload). Metadata keys: path (absolute), bytes,
+    format, mime_type, width/height (PNG only), backend (the one that succeeded),
+    region, inline, display, duration_seconds.
+
+Security: a screenshot captures whatever is on screen, which may include
+sensitive data (passwords, tokens, private messages). Treat captured images as
+secret.
+"""
+
+
 # --------------------------------------------------------------------------
 # Server construction
 # --------------------------------------------------------------------------
@@ -1777,6 +2148,7 @@ def build_server(service: ShellService) -> FastMCP:
     server.add_tool(service.abort_upload, description=abort_upload_doc)
     server.add_tool(service.file_sha256, description=file_sha256_doc)
     server.add_tool(service.git_push, description=git_push_doc)
+    server.add_tool(service.screenshot, description=screenshot_doc)
     server.shell_service = service  # type: ignore[attr-defined]
     return server
 
