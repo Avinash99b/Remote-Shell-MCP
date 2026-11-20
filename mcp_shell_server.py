@@ -1401,6 +1401,44 @@ class ShellService:
             "overwritten": existed,
         }
 
+
+    # Single-call text/binary write: write a file from a plain text string.
+    async def write_file(
+        self,
+        path: str,
+        content: str,
+        overwrite: bool = False,
+    ) -> dict[str, Any]:
+        target = self._resolve_path(path)
+        return await asyncio.to_thread(self._write_file_text, target, content, overwrite)
+
+    @staticmethod
+    def _write_file_text(target: str, content: str, overwrite: bool) -> dict[str, Any]:
+        if os.path.isdir(target):
+            raise IsADirectoryError(f"{target} is a directory")
+        existed = os.path.isfile(target)
+        if existed and not overwrite:
+            raise FileExistsError(f"{target} already exists; pass overwrite=true to replace it")
+        os.makedirs(os.path.dirname(os.path.abspath(target)), exist_ok=True)
+        encoded = content.encode("utf-8")
+        tmp = f"{target}.part-write"
+        try:
+            with open(tmp, "wb") as fh:
+                fh.write(encoded)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, target)
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        req_log.info("WRITE_FILE  | path=%s | bytes=%d | overwritten=%s", target, len(encoded), existed)
+        return {
+            "path": target,
+            "bytes": len(encoded),
+            "sha256": hashlib.sha256(encoded).hexdigest(),
+            "overwritten": existed,
+        }
+
     # Chunked upload: begin -> upload_chunk (repeat) -> finish. Any size.
     async def begin_upload(self, path: str, overwrite: bool = False, executable: bool = False) -> dict[str, Any]:
         target = self._resolve_path(path)
@@ -1963,6 +2001,19 @@ Returns:
     {"path", "bytes", "sha256", "overwritten"}.
 """
 
+
+write_file_doc = """
+Write a file from a plain-text string in a single call. Good for new files and small rewrites.
+
+Args:
+    path: Destination path. Relative paths resolve against the server's working directory.
+    content: The file contents as a UTF-8 string.
+    overwrite: Replace the file if it already exists (default false).
+
+Returns:
+    {"path", "bytes", "sha256", "overwritten"}.
+"""
+
 begin_upload_doc = """
 Start a chunked upload. Returns an upload_id to use with upload_chunk and finish_upload.
 
@@ -2141,6 +2192,7 @@ def build_server(service: ShellService) -> FastMCP:
     server.add_tool(service.cleanup_jobs, description=cleanup_jobs_doc)
     server.add_tool(service.get_diagnostics, description=get_diagnostics_doc)
     server.add_tool(service.upload_file, description=upload_file_doc)
+    server.add_tool(service.write_file, description=write_file_doc)
     server.add_tool(service.download_file, description=download_file_doc)
     server.add_tool(service.begin_upload, description=begin_upload_doc)
     server.add_tool(service.upload_chunk, description=upload_chunk_doc)
@@ -2273,6 +2325,11 @@ async def cleanup_jobs(older_than_seconds: float | None = None) -> dict[str, Any
 
 async def get_diagnostics() -> dict[str, Any]:
     return await SERVICE.get_diagnostics()
+
+
+
+async def write_file(path: str, content: str, overwrite: bool = False) -> dict[str, Any]:
+    return await SERVICE.write_file(path, content, overwrite=overwrite)
 
 
 if __name__ == "__main__":
