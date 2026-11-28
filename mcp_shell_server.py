@@ -52,6 +52,11 @@ emitted and a stalled log consumer can never block requests. Use --log-level or
 
 The agent connects to:  http://<host>:<port>/mcp
 with header:            Authorization: Bearer <token>   (unless --no-auth)
+
+A browser upload page is served at the root:  http://<host>:<port>/
+It uploads files to a folder the user picks (default: /kaggle/working/uploads,
+override with --upload-dir). When the destination folder is missing the page
+asks whether to create it recursively before uploading.
 """
 
 from __future__ import annotations
@@ -87,7 +92,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import CallToolResult, ImageContent, TextContent
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import HTMLResponse, JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 # --------------------------------------------------------------------------
@@ -373,6 +378,8 @@ class Config:
     cleanup_interval_seconds: float = 60.0
     cwd: str = field(default_factory=os.getcwd)
     allowed_hosts: tuple = ()
+    # Default destination folder offered by the browser upload page at "/".
+    upload_dir: str = "/kaggle/working/uploads"
     # Logging: routine request/job + third-party logging is gated by this level
     # (default WARNING, so the stderr pipe does not fill). Startup lines, warnings
     # and errors are always emitted regardless.
@@ -421,6 +428,11 @@ def parse_args() -> Config:
     )
     p.add_argument("--max-jobs", type=int, default=256, help="Maximum completed jobs retained (default: 256)")
     p.add_argument("--cwd", default=os.getcwd(), help="Working directory for executed commands")
+    p.add_argument(
+        "--upload-dir",
+        default="/kaggle/working/uploads",
+        help="Default destination folder shown by the browser upload page at / (default: /kaggle/working/uploads)",
+    )
     p.add_argument("--allowed-host", action="append", default=[],
                    help="Extra Host header to accept when behind a proxy/tunnel, e.g. shell-mcp-proxy.example.com (repeatable)")
     p.add_argument(
@@ -494,6 +506,7 @@ def parse_args() -> Config:
         max_jobs=a.max_jobs,
         cwd=a.cwd,
         allowed_hosts=tuple(a.allowed_host),
+        upload_dir=a.upload_dir,
         log_level=a.log_level,
         log_file=a.log_file,
     )
@@ -1336,6 +1349,11 @@ class ShellService:
         except Exception:
             pass
 
+        try:
+            upload_dir = self._resolve_path(self.cfg.upload_dir)
+        except ValueError:
+            upload_dir = self.cfg.cwd
+
         return {
             "status": "ok",
             "uptime_seconds": round(time.monotonic() - self._start_time, 1),
@@ -1347,6 +1365,8 @@ class ShellService:
             "active_uploads": active_uploads,
             "max_rss_mb": max_rss_mb,
             "cwd": self.cfg.cwd,
+            "upload_dir": upload_dir,
+            "auth_required": not self.cfg.no_auth,
         }
 
     def shutdown(self) -> None:
@@ -1359,6 +1379,42 @@ class ShellService:
         if not isinstance(path, str) or not path.strip():
             raise ValueError("path must be a non-empty string")
         return os.path.abspath(os.path.join(self.cfg.cwd, os.path.expanduser(path)))
+
+    def resolve_upload_target(self, directory: Any, filename: Any) -> tuple[str, str]:
+        """Resolve the destination folder and file path for a browser upload.
+
+        ``directory`` may be absolute or relative to the server's working
+        directory; a blank value falls back to ``cfg.upload_dir``. ``filename``
+        must be a plain file name (no directory components).
+        """
+        if not isinstance(filename, str) or not filename.strip():
+            raise ValueError("filename must be a non-empty string")
+        name = filename.strip()
+        if name in (".", "..") or "/" in name or "\\" in name or "\x00" in name:
+            raise ValueError("filename must be a plain file name with no directory components")
+        if not isinstance(directory, str) or not directory.strip():
+            directory = self.cfg.upload_dir
+        folder = self._resolve_path(directory.strip())
+        return folder, os.path.join(folder, name)
+
+    def inspect_upload_target(self, directory: Any, filename: Any) -> dict[str, Any]:
+        """Describe where an upload would land, without writing anything."""
+        folder, target = self.resolve_upload_target(directory, filename)
+        parent_exists = os.path.isdir(folder)
+        try:
+            default_directory = self._resolve_path(self.cfg.upload_dir)
+        except ValueError:
+            default_directory = self.cfg.cwd
+        return {
+            "directory": folder,
+            "filename": os.path.basename(target),
+            "path": target,
+            "parent_exists": parent_exists,
+            "parent_is_file": os.path.exists(folder) and not parent_exists,
+            "target_exists": os.path.exists(target) and not os.path.isdir(target),
+            "target_is_dir": os.path.isdir(target),
+            "default_directory": default_directory,
+        }
 
     # Single-call upload: the whole file in one message. Fine for small files; use the
     # chunked tools (begin_upload / upload_chunk / finish_upload) for anything large.
@@ -2105,7 +2161,8 @@ Return safe compact server diagnostics (status, active jobs, uptime, memory) wit
 
 Returns:
     A dict including: status, uptime_seconds, pid, stateless_http, json_response,
-    active_jobs, retained_jobs, active_uploads, max_rss_mb, cwd.
+    active_jobs, retained_jobs, active_uploads, max_rss_mb, cwd, upload_dir,
+    auth_required.
 """
 
 
@@ -2151,6 +2208,425 @@ secret.
 # --------------------------------------------------------------------------
 # Server construction
 # --------------------------------------------------------------------------
+_UPLOAD_PAGE_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Remote Shell — File Upload</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f6f7f9;
+    --card: #ffffff;
+    --text: #16181d;
+    --muted: #5b6472;
+    --line: #dfe3e9;
+    --accent: #2563eb;
+    --accent-text: #ffffff;
+    --ok: #15803d;
+    --err: #b91c1c;
+    --skip: #a16207;
+    --code: #eef1f5;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1218;
+      --card: #171b23;
+      --text: #e8ebf0;
+      --muted: #9aa4b2;
+      --line: #2a3140;
+      --accent: #3b82f6;
+      --accent-text: #ffffff;
+      --ok: #4ade80;
+      --err: #f87171;
+      --skip: #facc15;
+      --code: #222834;
+    }
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 760px; margin: 0 auto; padding: 32px 20px 64px; }
+  h1 { font-size: 1.6rem; margin: 0 0 6px; letter-spacing: -0.02em; }
+  h2 { font-size: 1.05rem; margin: 0 0 12px; }
+  .sub { color: var(--muted); margin: 0 0 24px; }
+  code { background: var(--code); padding: 1px 5px; border-radius: 4px; font-size: 0.9em; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 20px;
+    margin-bottom: 18px;
+    box-shadow: 0 1px 2px rgb(0 0 0 / 0.04);
+  }
+  label { display: block; font-weight: 600; margin: 16px 0 6px; }
+  label:first-child { margin-top: 0; }
+  input[type=text], input[type=password] {
+    width: 100%;
+    padding: 10px 12px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--bg);
+    color: var(--text);
+    font: inherit;
+  }
+  input[type=text]:focus, input[type=password]:focus {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+    border-color: transparent;
+  }
+  .hint { color: var(--muted); font-size: 0.85rem; margin: 6px 0 0; }
+  .check { display: flex; align-items: center; gap: 8px; font-weight: 500; margin-top: 18px; }
+  .drop {
+    border: 2px dashed var(--line);
+    border-radius: 10px;
+    padding: 22px;
+    text-align: center;
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    transition: border-color .15s, background .15s;
+  }
+  .drop:hover, .drop:focus, .drop.over {
+    border-color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 7%, transparent);
+    outline: none;
+  }
+  .drop span { color: var(--muted); font-size: 0.9rem; word-break: break-word; }
+  button {
+    margin-top: 20px;
+    width: 100%;
+    padding: 11px 16px;
+    border: 0;
+    border-radius: 8px;
+    background: var(--accent);
+    color: var(--accent-text);
+    font: inherit;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button:disabled { opacity: .6; cursor: progress; }
+  .bar { height: 8px; background: var(--code); border-radius: 999px; overflow: hidden; margin-bottom: 14px; }
+  .bar > div { height: 100%; width: 0; background: var(--accent); transition: width .15s; }
+  ul { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 8px; }
+  li { padding: 9px 11px; border-radius: 8px; background: var(--bg); border: 1px solid var(--line); word-break: break-word; }
+  li.ok { color: var(--ok); }
+  li.err { color: var(--err); }
+  li.skip { color: var(--skip); }
+  .msg { margin: 14px 0 0; color: var(--err); min-height: 1.2em; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Upload files</h1>
+  <p class="sub">Save files onto this server. The MCP endpoint remains at <code>/mcp</code>.</p>
+
+  <section class="card">
+    <label for="token">Bearer token <span id="tokenHint" class="hint"></span></label>
+    <input id="token" type="password" autocomplete="off" spellcheck="false" placeholder="Only needed when auth is enabled">
+    <p class="hint">Kept in this browser only (localStorage).</p>
+
+    <label for="folder">Destination folder</label>
+    <input id="folder" type="text" spellcheck="false" placeholder="/kaggle/working/uploads">
+    <p class="hint">Absolute, or relative to the server's working directory. You can change it for each upload.</p>
+
+    <label>Files</label>
+    <div id="drop" class="drop" tabindex="0" role="button" aria-label="Choose or drop files">
+      <input id="file" type="file" multiple hidden>
+      <strong>Choose files</strong>
+      <span id="dropText">or drag and drop them here</span>
+    </div>
+
+    <label for="filename" id="filenameLabel" hidden>File name</label>
+    <input id="filename" type="text" spellcheck="false" hidden>
+    <p class="hint" id="filenameHint" hidden>Rename the file if you like; it is saved inside the folder above.</p>
+
+    <label class="check"><input id="overwrite" type="checkbox"> Overwrite existing files</label>
+
+    <button id="upload" type="button">Upload</button>
+    <p class="msg" id="msg" role="status"></p>
+  </section>
+
+  <section id="status" class="card" hidden>
+    <h2>Progress</h2>
+    <div class="bar"><div id="bar"></div></div>
+    <ul id="results"></ul>
+  </section>
+</main>
+<script>
+(function () {
+  "use strict";
+
+  var TOKEN_KEY = "mcp-shell-token";
+  var DEFAULT_FOLDER = "/kaggle/working/uploads";
+
+  var $ = function (id) { return document.getElementById(id); };
+  var tokenInput = $("token");
+  var folderInput = $("folder");
+  var fileInput = $("file");
+  var filenameInput = $("filename");
+  var drop = $("drop");
+  var results = $("results");
+  var bar = $("bar");
+  var msg = $("msg");
+  var uploadButton = $("upload");
+  var authRequired = false;
+  var selectedFiles = [];
+
+  function Skipped(text) { this.message = text; }
+  Skipped.prototype = Object.create(Error.prototype);
+  Skipped.prototype.constructor = Skipped;
+
+  function rememberToken() {
+    try { localStorage.setItem(TOKEN_KEY, tokenInput.value); } catch (e) {}
+  }
+
+  try { tokenInput.value = localStorage.getItem(TOKEN_KEY) || ""; } catch (e) {}
+  var params = new URLSearchParams(window.location.search);
+  if (params.get("token")) {
+    tokenInput.value = params.get("token");
+    rememberToken();
+    params.delete("token");
+    var q = params.toString();
+    window.history.replaceState(null, "", window.location.pathname + (q ? "?" + q : ""));
+  }
+  tokenInput.addEventListener("change", rememberToken);
+
+  function authHeaders() {
+    var token = tokenInput.value.trim();
+    return token ? { "Authorization": "Bearer " + token } : {};
+  }
+
+  function formatBytes(n) {
+    if (n < 1024) return n + " B";
+    var units = ["KB", "MB", "GB", "TB"];
+    var value = n / 1024;
+    var i = 0;
+    while (value >= 1024 && i < units.length - 1) { value /= 1024; i++; }
+    return value.toFixed(value >= 10 ? 0 : 1) + " " + units[i];
+  }
+
+  function setMessage(text) { msg.textContent = text || ""; }
+
+  function addResult(text, cls) {
+    var li = document.createElement("li");
+    li.textContent = text;
+    if (cls) li.className = cls;
+    results.appendChild(li);
+    return li;
+  }
+
+  function setFiles(files) {
+    selectedFiles = Array.prototype.slice.call(files || []);
+    if (selectedFiles.length === 1) {
+      filenameInput.hidden = false;
+      $("filenameLabel").hidden = false;
+      $("filenameHint").hidden = false;
+      filenameInput.value = selectedFiles[0].name;
+    } else {
+      filenameInput.hidden = true;
+      $("filenameLabel").hidden = true;
+      $("filenameHint").hidden = true;
+      filenameInput.value = "";
+    }
+    $("dropText").textContent = selectedFiles.length
+      ? selectedFiles.map(function (f) { return f.name; }).join(", ")
+      : "or drag and drop them here";
+  }
+
+  fileInput.addEventListener("change", function () { setFiles(fileInput.files); });
+  drop.addEventListener("click", function () { fileInput.click(); });
+  drop.addEventListener("keydown", function (e) {
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); fileInput.click(); }
+  });
+  ["dragenter", "dragover"].forEach(function (name) {
+    drop.addEventListener(name, function (e) { e.preventDefault(); drop.classList.add("over"); });
+  });
+  ["dragleave", "drop"].forEach(function (name) {
+    drop.addEventListener(name, function (e) { e.preventDefault(); drop.classList.remove("over"); });
+  });
+  drop.addEventListener("drop", function (e) {
+    if (e.dataTransfer && e.dataTransfer.files) setFiles(e.dataTransfer.files);
+  });
+
+  async function loadConfig() {
+    try {
+      var res = await fetch("/health", { headers: { "Accept": "application/json" } });
+      if (res.ok) {
+        var cfg = await res.json();
+        authRequired = !!cfg.auth_required;
+        var folder = cfg.upload_dir || DEFAULT_FOLDER;
+        folderInput.value = folder;
+        folderInput.placeholder = folder;
+      }
+    } catch (e) {}
+    if (!folderInput.value) folderInput.value = DEFAULT_FOLDER;
+    $("tokenHint").textContent = authRequired ? "(required)" : "(not required)";
+  }
+
+  async function checkTarget(directory, filename) {
+    var res = await fetch("/api/check", {
+      method: "POST",
+      headers: Object.assign({ "Content-Type": "application/json" }, authHeaders()),
+      body: JSON.stringify({ directory: directory, filename: filename })
+    });
+    var data = {};
+    try { data = await res.json(); } catch (e) {}
+    if (res.status === 401) throw new Error("Unauthorized — check the bearer token.");
+    if (!res.ok || !data.ok) throw new Error(data.message || ("Could not check the destination (" + res.status + ")"));
+    return data;
+  }
+
+  function uploadFile(file, directory, filename, options, onProgress) {
+    return new Promise(function (resolve, reject) {
+      var query = new URLSearchParams({
+        directory: directory,
+        filename: filename,
+        create_dirs: options.createDirs ? "1" : "0",
+        overwrite: options.overwrite ? "1" : "0"
+      });
+      var xhr = new XMLHttpRequest();
+      xhr.open("POST", "/api/upload?" + query.toString());
+      var token = tokenInput.value.trim();
+      if (token) xhr.setRequestHeader("Authorization", "Bearer " + token);
+      xhr.upload.onprogress = function (e) {
+        if (e.lengthComputable) onProgress(e.loaded / e.total);
+      };
+      xhr.onload = function () {
+        var data = {};
+        try { data = JSON.parse(xhr.responseText); } catch (e) {}
+        if (xhr.status === 401) return reject(new Error("Unauthorized — check the bearer token."));
+        if (xhr.status >= 200 && xhr.status < 300 && data.ok) return resolve(data);
+        var err = new Error(data.message || data.error || ("Upload failed (" + xhr.status + ")"));
+        err.status = xhr.status;
+        err.data = data;
+        reject(err);
+      };
+      xhr.onerror = function () { reject(new Error("Network error during upload.")); };
+      xhr.send(file);
+    });
+  }
+
+  async function uploadWithPrompts(file, directory, filename, onProgress) {
+    var createDirs = false;
+    var overwrite = $("overwrite").checked;
+
+    for (var attempt = 0; attempt < 3; attempt++) {
+      var info = await checkTarget(directory, filename);
+      if (info.parent_is_file) throw new Error("Destination is not a folder: " + info.directory);
+      if (!info.parent_exists) {
+        if (!window.confirm("Destination folder does not exist:\n\n" + info.directory + "\n\nCreate it recursively?")) {
+          throw new Skipped("skipped — folder was not created");
+        }
+        createDirs = true;
+      }
+      if (info.target_is_dir) throw new Error(info.path + " is a directory");
+      if (info.target_exists && !overwrite) {
+        if (!window.confirm(info.path + " already exists.\n\nOverwrite it?")) {
+          throw new Skipped("skipped — existing file was not overwritten");
+        }
+        overwrite = true;
+      }
+
+      try {
+        return await uploadFile(file, directory, filename, { createDirs: createDirs, overwrite: overwrite }, onProgress);
+      } catch (err) {
+        if (err.status === 409 && err.data && err.data.error === "parent_missing" && !createDirs) {
+          if (!window.confirm("Destination folder does not exist:\n\n" + (err.data.directory || directory) + "\n\nCreate it recursively and retry?")) {
+            throw new Skipped("skipped — folder was not created");
+          }
+          createDirs = true;
+          continue;
+        }
+        if (err.status === 409 && err.data && err.data.error === "file_exists" && !overwrite) {
+          if (!window.confirm((err.data.path || filename) + " already exists.\n\nOverwrite it?")) {
+            throw new Skipped("skipped — existing file was not overwritten");
+          }
+          overwrite = true;
+          continue;
+        }
+        throw err;
+      }
+    }
+    throw new Error("gave up after repeated destination conflicts");
+  }
+
+  async function startUpload() {
+    setMessage("");
+    results.innerHTML = "";
+    bar.style.width = "0";
+
+    if (!selectedFiles.length) {
+      setMessage("Choose at least one file first.");
+      return;
+    }
+    if (authRequired && !tokenInput.value.trim()) {
+      setMessage("Enter the bearer token (it is printed in the server logs).");
+      return;
+    }
+
+    var directory = folderInput.value.trim() || DEFAULT_FOLDER;
+    var total = selectedFiles.length;
+    $("status").hidden = false;
+    uploadButton.disabled = true;
+
+    try {
+      for (var i = 0; i < total; i++) {
+        var file = selectedFiles[i];
+        var filename = total === 1
+          ? (filenameInput.value.trim() || file.name)
+          : file.name;
+        var row = addResult(filename + " — uploading…", "");
+
+        try {
+          var result = await uploadWithPrompts(file, directory, filename, function (p) {
+            bar.style.width = Math.round(((i + p) / total) * 100) + "%";
+          });
+          row.className = "ok";
+          row.textContent = result.path + " — " + formatBytes(result.bytes) +
+            (result.overwritten ? " — overwritten" : "") +
+            " — sha256 " + result.sha256.slice(0, 16) + "…";
+        } catch (err) {
+          if (err instanceof Skipped) {
+            row.className = "skip";
+            row.textContent = filename + " — " + err.message;
+          } else {
+            row.className = "err";
+            row.textContent = filename + " — " + (err.message || String(err));
+          }
+        }
+      }
+      bar.style.width = "100%";
+    } finally {
+      uploadButton.disabled = false;
+    }
+  }
+
+  uploadButton.addEventListener("click", startUpload);
+  loadConfig();
+})();
+</script>
+</body>
+</html>
+"""
+
+
+def _parse_bool(value: Any, default: bool = False) -> bool:
+    """Parse a query-string boolean (``1/true/yes/on``)."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
 def _transport_security(cfg: Config) -> TransportSecuritySettings:
     return TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
@@ -2217,7 +2693,14 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next):
         cfg = self._cfg
-        if cfg.no_auth or request.method == "OPTIONS" or request.url.path == "/health":
+        path = request.url.path
+        if (
+            cfg.no_auth
+            or request.method == "OPTIONS"
+            or path == "/health"
+            # The upload page itself is public; its write APIs stay token-gated.
+            or (path == "/" and request.method in ("GET", "HEAD"))
+        ):
             return await call_next(request)
 
         auth = request.headers.get("authorization", "")
@@ -2229,17 +2712,128 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 
 
 def build_app(cfg: Config):
-    """Build the Starlette ASGI app (MCP transport + auth) for ``cfg``."""
+    """Build the Starlette ASGI app (MCP transport + upload page + auth) for ``cfg``."""
     global CFG, SERVICE
     CFG = cfg
-    SERVICE = create_service(cfg)
-    SERVICE.start_reaper()
-    app = build_server(SERVICE).streamable_http_app()
-    app.state.shell_service = SERVICE
+    service = create_service(cfg)
+    SERVICE = service
+    service.start_reaper()
+    app = build_server(service).streamable_http_app()
+    app.state.shell_service = service
 
     async def health_endpoint(request: Request) -> JSONResponse:
-        return JSONResponse(SERVICE._get_diagnostics())
+        return JSONResponse(service._get_diagnostics())
 
+    async def index_endpoint(request: Request) -> HTMLResponse:
+        return HTMLResponse(_UPLOAD_PAGE_HTML)
+
+    async def check_upload_endpoint(request: Request) -> JSONResponse:
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = None
+        if not isinstance(payload, dict):
+            return JSONResponse(
+                {"ok": False, "error": "invalid_request", "message": "Expected a JSON object."},
+                status_code=400,
+            )
+        try:
+            info = await asyncio.to_thread(
+                service.inspect_upload_target, payload.get("directory"), payload.get("filename")
+            )
+        except (ValueError, OSError) as e:
+            return JSONResponse({"ok": False, "error": "invalid", "message": str(e)}, status_code=400)
+        return JSONResponse({"ok": True, **info})
+
+    async def upload_endpoint(request: Request) -> JSONResponse:
+        query = request.query_params
+        try:
+            folder, target = await asyncio.to_thread(
+                service.resolve_upload_target, query.get("directory"), query.get("filename")
+            )
+        except (ValueError, OSError) as e:
+            return JSONResponse({"ok": False, "error": "invalid", "message": str(e)}, status_code=400)
+
+        create_dirs = _parse_bool(query.get("create_dirs"))
+        overwrite = _parse_bool(query.get("overwrite"))
+
+        if os.path.exists(folder) and not os.path.isdir(folder):
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": "parent_not_directory",
+                    "directory": folder,
+                    "message": f"Destination is not a folder: {folder}",
+                },
+                status_code=409,
+            )
+        if not os.path.isdir(folder):
+            if not create_dirs:
+                return JSONResponse(
+                    {
+                        "ok": False,
+                        "error": "parent_missing",
+                        "directory": folder,
+                        "message": f"Destination folder does not exist: {folder}. Create it recursively and retry?",
+                    },
+                    status_code=409,
+                )
+            try:
+                await asyncio.to_thread(os.makedirs, folder, 0o777, True)
+            except OSError as e:
+                return JSONResponse(
+                    {"ok": False, "error": "mkdir_failed", "message": f"Could not create {folder}: {e}"},
+                    status_code=400,
+                )
+
+        if os.path.isdir(target):
+            return JSONResponse(
+                {"ok": False, "error": "target_is_directory", "message": f"{target} is a directory"},
+                status_code=400,
+            )
+        existed = os.path.exists(target)
+        if existed and not overwrite:
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "error": "file_exists",
+                    "path": target,
+                    "message": f"{target} already exists. Overwrite it?",
+                },
+                status_code=409,
+            )
+
+        tmp = f"{target}.part-{uuid.uuid4().hex[:8]}"
+        digest = hashlib.sha256()
+        size = 0
+        try:
+            async with await anyio.open_file(tmp, "wb") as fh:
+                async for chunk in request.stream():
+                    if not chunk:
+                        continue
+                    digest.update(chunk)
+                    size += len(chunk)
+                    await fh.write(chunk)
+                await fh.flush()
+                await asyncio.to_thread(os.fsync, fh.wrapped.fileno())
+            os.replace(tmp, target)
+        except BaseException:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+            raise
+
+        sha = digest.hexdigest()
+        req_log.info("WEB UPLOAD  | path=%s | bytes=%d | overwritten=%s", target, size, existed)
+        return JSONResponse(
+            {"ok": True, "path": target, "bytes": size, "sha256": sha, "overwritten": existed}
+        )
+
+    app.add_route("/", index_endpoint, methods=["GET"])
+    app.add_route("/api/check", check_upload_endpoint, methods=["POST"])
+    app.add_route("/api/upload", upload_endpoint, methods=["POST"])
     app.add_route("/health", health_endpoint, methods=["GET"])
     app.add_middleware(BearerAuthMiddleware, cfg)
     return app
@@ -2250,6 +2844,7 @@ def main() -> None:
     # Apply the selected logging setup before any startup line is emitted.
     configure_logging(cfg.log_level, cfg.log_file, sdk_debug=cfg.sdk_debug, debug_payloads=cfg.debug_payloads)
     log.info("Starting MCP shell server on http://%s:%s/mcp", cfg.host, cfg.port)
+    log.info("Web upload page: http://%s:%s/ (default folder: %s)", cfg.host, cfg.port, cfg.upload_dir)
     log.info("Log level: %s%s", _log_level_name(cfg.log_level), f" -> {cfg.log_file}" if cfg.log_file else "")
     log.info("HTTP transport: %s | JSON response: %s", "stateless" if cfg.stateless_http else "stateful", cfg.json_response)
     if cfg.sdk_debug or cfg.debug_payloads:
